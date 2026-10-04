@@ -94,8 +94,10 @@ def build_runtime(root: Path, agent: Callable[[Path, BumpIn], list[str]], store:
         """Bump the project version."""
         return BumpOut(files_written=agent(root, args))
 
-    store = store or Store()
-    return Runtime(registry=reg, policy=Policy(), store=store, authenticator=TokenAuthenticator(now=store.now),
+    owns = store is None  # a store we create is the runtime's to close; one passed in stays the caller's
+    store = Store() if store is None else store
+    return Runtime(registry=reg, policy=Policy(), store=store, owns_store=owns,
+                   authenticator=TokenAuthenticator(now=store.now),
                    principals=[Principal(AGENT, grants=frozenset({"bump_version"})),
                                Principal(APPROVER, can_approve=True)])
 
@@ -120,8 +122,10 @@ def main() -> None:  # pragma: no cover - exercised by tests/test_demos.py via s
     for label, agent in (("careful agent", careful_agent), ("sloppy agent", sloppy_agent)):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            rt, key = run(agent, root / "ws", Store(str(root / "sar.db")))
-            receipt = rt.receipt(key)
+            with Store(str(root / "sar.db")) as store:
+                rt, key = run(agent, root / "ws", store)
+                receipt = rt.receipt(key)
+                rt.close()
             check = receipt["effects"]["check"]
             met = all(r["met"] for r in check["required"])
             print(f"{label.upper()}")

@@ -162,12 +162,20 @@ def test_runtime_killed_after_completion_replays_without_redispatch(tmp_path):
 @pytest.mark.parametrize("fault,refunds_after_kill,expect_calls", [
     ("slow_before_effect", 0, 2), ("slow_after_effect", 1, 1)])
 def test_timed_out_worker_is_killed_and_cannot_act_later(tmp_path, fault, refunds_after_kill, expect_calls):
+    service = rf.PaymentService(str(tmp_path / "ledger.db"))
+    with Store(str(tmp_path / "sar.db")) as store:
+        _killed_worker_scenario(service, store, tmp_path, fault, refunds_after_kill, expect_calls)
+
+
+def _killed_worker_scenario(service, store, tmp_path, fault, refunds_after_kill, expect_calls):
     import dataclasses
 
-    service = rf.PaymentService(str(tmp_path / "ledger.db"))
-    rt = rf.build_runtime(service, Store(str(tmp_path / "sar.db")))
+    rt = rf.build_runtime(service, store)
     spec = rt.registry.get("refund")
-    rt.registry.replace(dataclasses.replace(spec, timeout_s=3.0))
+    # The fault sleeps 30 s once inside the tool, so any timeout well under that kills the worker
+    # mid-call. It must also cover spawning the worker and importing SAR before the tool starts
+    # (seconds on a slow runner), or the worker is killed before it writes the ".inflight" marker.
+    rt.registry.replace(dataclasses.replace(spec, timeout_s=10.0))
     o = rt.propose(run_id="t", principal_id=rf.AGENT, call_id="c1", tool="refund", arguments=rf_args())
     rf.approve_as_finance(rt, o)
     service.fail_next = fault
@@ -182,7 +190,6 @@ def test_timed_out_worker_is_killed_and_cannot_act_later(tmp_path, fault, refund
     if out.state == "approved":
         out = rt.execute(o.key)
     assert out.state == "succeeded" and len(service.refunds) == 1 and service.calls == expect_calls
-    rt.store.close()
 
 
 def test_process_isolation_requires_importable_tools():

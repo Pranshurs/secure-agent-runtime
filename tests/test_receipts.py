@@ -138,8 +138,8 @@ def test_receipt_still_verifies_after_later_activity(refunded):
     assert verify_receipt(r, store=rt.store) == []
 
 
-def test_frame_violation_receipt(tmp_path):
-    rt, key = vb.run(vb.sloppy_agent, tmp_path)
+def test_frame_violation_receipt(tmp_path, store):
+    rt, key = vb.run(vb.sloppy_agent, tmp_path, store)
     r = rt.receipt(key)
     validate(r)
     assert r["outcome"] == "violated" and r["effects"]["declared"]["forbidden"] == ["tests/**", ".github/**"]

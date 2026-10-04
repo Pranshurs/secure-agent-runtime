@@ -240,6 +240,12 @@ class Store:
             if self._owner is not None and self._owner() is owner:
                 self._owner = None
 
+    def __enter__(self) -> Store:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
     def close(self) -> None:
         with self._lock:
             if not self.closed:

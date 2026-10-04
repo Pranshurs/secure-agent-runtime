@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import traceback
+
 import pytest
 
 from secure_agent_runtime.examples.notes import NotesApp, build_runtime
@@ -15,6 +17,26 @@ class Clock:
 
     def advance(self, s: float) -> None:
         self.t += s
+
+
+@pytest.fixture(autouse=True)
+def every_store_is_closed(monkeypatch):
+    """Ownership rule: whoever creates a Store closes it. Fails a test that leaves one open
+    (a leaked SQLite connection), naming where it was created. Autouse, so it is torn down
+    after the test's other fixtures, including ``store``."""
+    created: list[tuple[Store, str]] = []
+    real_init = Store.__init__
+
+    def tracking_init(self, *a, **kw):
+        real_init(self, *a, **kw)
+        created.append((self, "".join(traceback.format_stack(limit=6)[:-1])))
+
+    monkeypatch.setattr(Store, "__init__", tracking_init)
+    yield
+    leaked = [where for s, where in created if not s.closed]
+    for s, _ in created:
+        s.close()
+    assert not leaked, f"{len(leaked)} Store(s) left open; created at:\n" + "\n---\n".join(leaked)
 
 
 @pytest.fixture

@@ -35,7 +35,7 @@ def test_a1_forbidden_double_star_matches_paths_with_newlines():
 
 # -- A2: a result that can't be stored must not wedge the action ------------------------------ #
 
-def test_a2_unstorable_frame_result_does_not_leave_the_action_executing(tmp_path):
+def test_a2_unstorable_frame_result_does_not_leave_the_action_executing(tmp_path, store):
     try:  # APFS (macOS) refuses names that aren't valid UTF-8; ext4 and most others accept the bytes
         (tmp_path / "probe\udcff").write_bytes(b"")
     except OSError as exc:
@@ -47,7 +47,7 @@ def test_a2_unstorable_frame_result_does_not_leave_the_action_executing(tmp_path
         (root / "bad\udcff").write_bytes(b"x")  # surrogateescape'd non-UTF-8 name
         return []
 
-    rt = vb.build_runtime(vb.make_workspace(tmp_path), evil)
+    rt = vb.build_runtime(vb.make_workspace(tmp_path), evil, store)
     o = rt.propose(run_id="r", principal_id=vb.AGENT, call_id="c", tool="bump_version",
                    arguments={"from_version": "2.1.0", "to_version": "2.1.1"})
     rt.approve(o.key, credential=cred(rt, vb.APPROVER), action_digest=o.action_digest)
@@ -135,14 +135,14 @@ def test_a5_changing_the_key_id_breaks_the_hmac(rt):
 
 # -- A6: a discarded late result must not consume the pre-dispatch snapshot ------------------------- #
 
-def test_a6_late_discarded_result_keeps_the_snapshot_for_reconciliation(tmp_path):
+def test_a6_late_discarded_result_keeps_the_snapshot_for_reconciliation(tmp_path, store):
     release = threading.Event()
 
     def slow(root, args):
         release.wait(5)
         return vb.careful_agent(root, args)
 
-    rt = vb.build_runtime(vb.make_workspace(tmp_path), slow)
+    rt = vb.build_runtime(vb.make_workspace(tmp_path), slow, store)
     rt.registry.replace(dataclasses.replace(rt.registry.get("bump_version"), timeout_s=0.05))
     o = rt.propose(run_id="r", principal_id=vb.AGENT, call_id="c", tool="bump_version",
                    arguments={"from_version": "2.1.0", "to_version": "2.1.1"})
@@ -231,8 +231,9 @@ def test_b3_runtime_start_recovers_orphans(tmp_path, clock):
     rt.approve(o.key, credential=cred(rt, APPROVER), action_digest=o.action_digest)
     s.transition(o.key, "approved", "executing", dispatches=1)
     s.close()
-    rt2, _ = build_runtime(Store(str(tmp_path / "sar.db"), now=clock), app)
-    assert rt2.recovered == [o.key] and rt2.store.get_call(o.key).state == "effect_unknown"
+    with Store(str(tmp_path / "sar.db"), now=clock) as s2:
+        rt2, _ = build_runtime(s2, app)
+        assert rt2.recovered == [o.key] and rt2.store.get_call(o.key).state == "effect_unknown"
 
 
 def test_b3_resolve_on_executing_explains_recover(rt):
@@ -412,6 +413,36 @@ def test_a_store_that_fails_to_open_closes_its_connection_and_lock(tmp_path, mon
     Store(path).close()  # the file lock was released too
 
 
+def test_store_ownership_follows_who_created_it(tmp_path):
+    """A store a factory creates belongs to the runtime and closes with it; a store the
+    caller passes in is never closed by the runtime."""
+    from secure_agent_runtime import Policy, Runtime, ToolRegistry
+    from secure_agent_runtime.policy import Principal
+
+    owned, _ = build_runtime()  # created inside the factory
+    assert owned.owns_store and not owned.store.closed
+    owned.close()
+    assert owned.store.closed
+
+    with Store(str(tmp_path / "sar.db")) as mine:
+        with build_runtime(mine)[0] as rt:
+            assert not rt.owns_store
+        assert not mine.closed  # still the caller's
+        build_runtime(mine)  # and free for another runtime
+    assert mine.closed
+
+    dup = [Principal("p"), Principal("p")]
+    for owns in (True, False):
+        s = Store()
+        with pytest.raises(ValueError, match="duplicate") as failed:
+            Runtime(registry=ToolRegistry(), policy=Policy(), principals=dup, store=s, owns_store=owns)
+        assert s.closed is owns  # a failed constructor closes only a store it owns
+        if not owns:  # and never keeps the caller's store attached, even while its traceback lives
+            assert failed.traceback
+            build_runtime(s)[0].close()
+        s.close()
+
+
 def test_b8_closed_store_raises_a_store_error(store):
     from secure_agent_runtime.errors import StoreError
 
@@ -446,6 +477,7 @@ def test_lock_contention_fails_closed_with_a_store_error(tmp_path, clock):
         other.close()
     assert s.get_call(o.key).state == "approved" and app.invocations["read_note"] == 0
     assert rt.execute(o.key).state == "succeeded" and s.verify_audit()[0]
+    s.close()
 
 
 # -- S1 (stress harness): the in-memory worker map is shared by every calling thread ----------------- #

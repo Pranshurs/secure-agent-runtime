@@ -135,7 +135,8 @@ def test_timeout_before_effect_reconciles_to_not_applied_then_one_refund(service
     assert rt.execute(o.key).state == "effect_unknown"
     assert done.wait(5) and wait_for(lambda: store.events(kind="call.late_result_discarded"))
     assert rt.reconcile(o.key).state == "approved"
-    rt.registry.replace(rf.build_runtime(service).registry.get("refund"))  # provider healthy again
+    with rf.build_runtime(service) as healthy:  # a throwaway runtime, only for its "refund" spec
+        rt.registry.replace(healthy.registry.get("refund"))  # provider healthy again
     out = rt.execute(o.key)
     assert out.state == "succeeded" and len(service.refunds) == 1 and service.calls == 1
 

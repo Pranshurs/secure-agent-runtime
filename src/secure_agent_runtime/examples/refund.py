@@ -215,9 +215,10 @@ def build_runtime(service: PaymentService, store: Store | None = None, *, isolat
         rid, r = found
         return Applied(RefundOut(refund_id=rid, order=r["order"], amount_inr=r["amount_inr"]))
 
-    store = store or Store()
+    owns = store is None  # a store we create is the runtime's to close; one passed in stays the caller's
+    store = Store() if store is None else store
     kw.setdefault("authenticator", TokenAuthenticator(now=store.now))
-    return Runtime(registry=reg, policy=Policy(), store=store, principals=[
+    return Runtime(registry=reg, policy=Policy(), store=store, owns_store=owns, principals=[
         Principal(AGENT, grants=frozenset({"refund"})), Principal(APPROVER, can_approve=True)], **kw)
 
 
@@ -272,13 +273,15 @@ def main() -> None:  # pragma: no cover - exercised by tests/test_demos.py via s
     for fault, title in (("after_effect", "SAR, response lost AFTER the refund"),
                          ("before_effect", "SAR, request lost BEFORE the refund")):
         service = PaymentService()
-        rt, key, trace = run_sar(service, fault=fault, store=_temp_store())
-        print(title)
-        for line in trace:
-            print("  " + line)
-        signer, keys = _demo_signer()
-        receipt = rt.receipt(key, signer=signer)
-        problems = verify_receipt(receipt, store=rt.store, expect_key=key, **keys)
+        with _temp_store() as store:
+            rt, key, trace = run_sar(service, fault=fault, store=store)
+            print(title)
+            for line in trace:
+                print("  " + line)
+            signer, keys = _demo_signer()
+            receipt = rt.receipt(key, signer=signer)
+            problems = verify_receipt(receipt, store=rt.store, expect_key=key, **keys)
+            rt.close()
         print(f"  refunds issued: {len(service.refunds)}   total refunded: ₹{service.total_refunded(821):,}"
               f"   provider calls: {service.calls}")
         print(f"  receipt {receipt['receipt_id']}: outcome {receipt['outcome'].upper()}, "

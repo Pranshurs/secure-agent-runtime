@@ -533,6 +533,23 @@ MUTANTS: list[Mutant] = [
            "            outcome = self.runtime.reconcile(key)\n", ""),
     Mutant("A8", "per-turn call limit", A,
            "if turn is None or len(turn[1]) > self.max_calls_per_turn:", "if turn is None:"),
+    # -- resource ownership: whoever creates a Store closes it ---------------------------------- #
+    Mutant("O1", "closing a runtime closes the store it owns", R,
+           "        if self.owns_store:\n            self.store.close()\n\n    def __enter__",
+           "        if False:\n            self.store.close()\n\n    def __enter__"),
+    Mutant("O2", "closing a runtime never closes the caller's store", R,
+           "        if self.owns_store:\n            self.store.close()\n\n    def __enter__",
+           "        if True:\n            self.store.close()\n\n    def __enter__"),
+    Mutant("O3", "a failed constructor closes the store it owns", R,
+           "        except BaseException:\n            self.close()\n            raise",
+           "        except BaseException:\n            self.store.detach(self)\n            raise"),
+    Mutant("O4", "a failed constructor releases the caller's store", R,
+           "        except BaseException:\n            self.close()\n            raise",
+           "        except BaseException:\n            if self.owns_store:\n                self.store.close()\n            raise"),
+    Mutant("O5", "a Store that fails to open closes its connection", S,
+           "        if db is not None:\n            db.close()\n", ""),
+    Mutant("O6", "a store created by the factory is owned by the runtime", f"{PKG}/examples/notes.py",
+           "policy=Policy(), owns_store=owns,", "policy=Policy(), owns_store=False,"),
 ]
 
 
@@ -557,7 +574,7 @@ def run_suite(root: Path, timeout: float) -> tuple[bool, str]:
     except subprocess.TimeoutExpired:
         return False, "timeout"
     lines = (p.stdout + p.stderr).strip().splitlines()
-    failed = next((ln.split("::", 1)[1] for ln in lines if ln.startswith("FAILED ")), "")
+    failed = next((ln.split("::", 1)[-1] for ln in lines if ln.startswith(("FAILED ", "ERROR "))), "")
     return p.returncode == 0, failed or (lines[-1] if lines else "")
 
 

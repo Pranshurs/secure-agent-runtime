@@ -125,7 +125,7 @@ class Runtime:
                  store: Store, authenticator: Authenticator | None = None, approval_ttl_s: float = 3600.0,
                  max_stuck_workers: int = 32, recover_on_start: bool = True,
                  telemetry: Telemetry | None = None,
-                 faults: Callable[[str, str], None] | None = None) -> None:
+                 faults: Callable[[str, str], None] | None = None, owns_store: bool = False) -> None:
         """``faults(point, key)`` is a fault-injection hook called at execution boundaries.
         Raising from it simulates a crash there: at ``after_claim`` the exception propagates
         out of ``execute`` with the action claimed but not dispatched; at ``after_effect``
@@ -135,16 +135,39 @@ class Runtime:
         one, ``approve``/``reject``/``resolve`` refuse. ``approval_ttl_s`` bounds both the
         window to approve and the time an approval stays valid for dispatch.
         ``recover_on_start`` runs :meth:`recover` immediately: the store has a single owner
-        (see :class:`Store`), so any action still ``executing`` is an orphan of a crash."""
+        (see :class:`Store`), so any action still ``executing`` is an orphan of a crash.
+
+        ``owns_store`` says who closes ``store``. A store you pass in stays yours (the
+        default); a factory that creates the store itself passes ``owns_store=True`` so that
+        :meth:`close` closes it, as does a constructor that fails."""
         if approval_ttl_s <= 0:
             raise ValueError("approval_ttl_s must be positive")
-        store.attach(self)
+        self.owns_store = owns_store
+        try:
+            store.attach(self)
+        except BaseException:
+            if owns_store:
+                store.close()
+            raise
+        self.store = store
+        try:
+            self._setup(registry=registry, policy=policy, principals=principals, approval_ttl_s=approval_ttl_s,
+                        max_stuck_workers=max_stuck_workers, recover_on_start=recover_on_start,
+                        telemetry=telemetry, authenticator=authenticator, faults=faults)
+        except BaseException:
+            self.close()
+            raise
+
+    def _setup(self, *, registry: ToolRegistry, policy: Policy, principals: Iterable[Principal],
+               authenticator: Authenticator | None, approval_ttl_s: float, max_stuck_workers: int,
+               recover_on_start: bool, telemetry: Telemetry | None,
+               faults: Callable[[str, str], None] | None) -> None:
+        store = self.store
         self.telemetry = telemetry if telemetry is not None else Telemetry.from_global()
         self.authenticator = authenticator
         self.max_stuck_workers = max_stuck_workers
         self.registry = registry
         self.policy = policy
-        self.store = store
         self.approval_ttl_s = approval_ttl_s
         self._faults = faults or (lambda point, key: None)
         self._before: dict[str, tuple[int, Snapshot]] = {}  # key -> (attempt, pre-dispatch snapshot)
@@ -164,8 +187,17 @@ class Runtime:
                         "until reconciled", len(self.recovered))
 
     def close(self) -> None:
-        """Release the store for another Runtime (the store itself stays open)."""
+        """Release the store for another Runtime. The store is closed too only if this
+        Runtime owns it (``owns_store=True``); a store passed in stays open for its owner."""
         self.store.detach(self)
+        if self.owns_store:
+            self.store.close()
+
+    def __enter__(self) -> Runtime:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
     def principal(self, principal_id: str) -> Principal | None:
         return self._principals.get(principal_id)

@@ -193,16 +193,16 @@ def test_mapping_observer():
 
 # -- through the runtime ----------------------------------------------------------------------- #
 
-def test_careful_agent_is_verified(tmp_path):
-    rt, key = vb.run(vb.careful_agent, tmp_path)
+def test_careful_agent_is_verified(tmp_path, store):
+    rt, key = vb.run(vb.careful_agent, tmp_path, store)
     out = rt.execute(key)
     assert out.state == "succeeded" and out.verification == "verified"
     assert out.for_model()["verification"] == "verified"
     assert rt.receipt(key)["outcome"] == "verified"
 
 
-def test_sloppy_agent_passes_outcome_check_but_fails_frame(tmp_path):
-    rt, key = vb.run(vb.sloppy_agent, tmp_path)
+def test_sloppy_agent_passes_outcome_check_but_fails_frame(tmp_path, store):
+    rt, key = vb.run(vb.sloppy_agent, tmp_path, store)
     assert vb.conventional_check(tmp_path) is True
     receipt = rt.receipt(key)
     check = receipt["effects"]["check"]
@@ -211,13 +211,13 @@ def test_sloppy_agent_passes_outcome_check_but_fails_frame(tmp_path):
     assert all(r["met"] for r in check["required"])
 
 
-def test_agent_that_misses_the_requirement_is_violated(tmp_path):
-    rt, key = vb.run(lambda root, args: [], tmp_path)
+def test_agent_that_misses_the_requirement_is_violated(tmp_path, store):
+    rt, key = vb.run(lambda root, args: [], tmp_path, store)
     assert rt.receipt(key)["outcome"] == "violated"
 
 
-def test_declared_frame_is_part_of_what_was_approved(tmp_path):
-    rt = vb.build_runtime(vb.make_workspace(tmp_path), vb.careful_agent)
+def test_declared_frame_is_part_of_what_was_approved(tmp_path, store):
+    rt = vb.build_runtime(vb.make_workspace(tmp_path), vb.careful_agent, store)
     o = rt.propose(run_id="r", principal_id=vb.AGENT, call_id="c", tool="bump_version",
                    arguments={"from_version": "2.1.0", "to_version": "2.1.1"})
     rt.approve(o.key, credential=cred(rt, vb.APPROVER), action_digest=o.action_digest)
@@ -229,8 +229,8 @@ def test_declared_frame_is_part_of_what_was_approved(tmp_path):
     assert (tmp_path / "pyproject.toml").read_text() == vb.FILES["pyproject.toml"]
 
 
-def test_failing_frame_builder_makes_the_proposal_invalid(tmp_path):
-    rt = vb.build_runtime(vb.make_workspace(tmp_path), vb.careful_agent)
+def test_failing_frame_builder_makes_the_proposal_invalid(tmp_path, store):
+    rt = vb.build_runtime(vb.make_workspace(tmp_path), vb.careful_agent, store)
     spec = rt.registry.get("bump_version")
     rt.registry.replace(dataclasses.replace(spec, frame=lambda a: 1 / 0))
     o = rt.propose(run_id="r", principal_id=vb.AGENT, call_id="c", tool="bump_version",
@@ -238,9 +238,9 @@ def test_failing_frame_builder_makes_the_proposal_invalid(tmp_path):
     assert o.state == "invalid" and "ZeroDivisionError" in o.reason
 
 
-def test_observer_failure_before_dispatch_blocks_the_tool(tmp_path):
+def test_observer_failure_before_dispatch_blocks_the_tool(tmp_path, store):
     calls = []
-    rt = vb.build_runtime(vb.make_workspace(tmp_path), lambda root, args: calls.append(1) or [])
+    rt = vb.build_runtime(vb.make_workspace(tmp_path), lambda root, args: calls.append(1) or [], store)
 
     class Broken:
         def snapshot(self):

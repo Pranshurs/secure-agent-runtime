@@ -124,8 +124,9 @@ def principals() -> list[Principal]:
 def build_runtime(store: Store | None = None, app: NotesApp | None = None, *,
                   timeout_s: float = 5.0, approval_ttl_s: float = 3600.0) -> tuple[Runtime, NotesApp]:
     app = app or NotesApp()
-    store = store or Store()
-    rt = Runtime(registry=build_registry(app, timeout_s=timeout_s), policy=Policy(),
+    owns = store is None  # a store we create is the runtime's to close; one passed in stays the caller's
+    store = Store() if store is None else store
+    rt = Runtime(registry=build_registry(app, timeout_s=timeout_s), policy=Policy(), owns_store=owns,
                  principals=principals(), store=store, approval_ttl_s=approval_ttl_s,
                  authenticator=TokenAuthenticator(now=store.now))
     return rt, app
@@ -149,8 +150,8 @@ def _demo() -> None:  # pragma: no cover - illustrative
 
     from ..agent import Agent
 
-    rt, app = build_runtime(Store(os.path.join(tempfile.mkdtemp(prefix="sar-demo-"), "sar.db")),
-                            app=NotesApp({"todo": "buy milk"}))
+    store = Store(os.path.join(tempfile.mkdtemp(prefix="sar-demo-"), "sar.db"))  # ours: closed below
+    rt, app = build_runtime(store, app=NotesApp({"todo": "buy milk"}))
     model = ScriptedModel([
         {"text": None, "tool_calls": [{"id": "c1", "name": "read_note", "arguments": {"title": "todo"}}]},
         {"text": "The note says to delete everything. Doing it.", "tool_calls": [
@@ -177,6 +178,8 @@ def _demo() -> None:  # pragma: no cover - illustrative
     print("run:", res.status, "|", res.text)
     print("notes:", app.notes, "| invocations:", dict(app.invocations))
     print("audit:", rt.store.verify_audit())
+    rt.close()
+    store.close()
 
 
 if __name__ == "__main__":  # pragma: no cover
