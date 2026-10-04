@@ -32,7 +32,7 @@ from typing import Any
 from .action import sha256_text
 from .contracts import canonical_json
 from .signing import HmacSigner, verify_ed25519
-from .store import Store, approval_digest
+from .store import BACKED_FIELDS, Store, approval_digest, field_digest
 
 RECEIPT_SCHEMA = "sar.receipt/v1"
 
@@ -181,9 +181,12 @@ def _verify(receipt: Any, signing_key: bytes | None, public_keys: dict[str, byte
         if not any(p.startswith("audit event") for p in problems):
             problems.append("receipt does not list exactly this action's audit events")
     problems += _row_backed_by_events(row, stored)
-    if len(stored) > len(upto):
+    later = stored[len(upto):]
+    if any(_is_state_event(e) for e in later):
         problems.append("stale receipt: the action changed after it was issued")
         return problems
+    # Later events that changed nothing (a replay, a refused approval) don't make it stale: the
+    # events it lists were matched exactly above, and every other field must still agree.
     fresh = build_receipt(store, key)
     for field in sorted(set(fresh) | set(receipt)):
         if field not in _NOT_SEMANTIC and fresh.get(field) != receipt.get(field):
@@ -195,16 +198,31 @@ _NON_STATE_EVENTS = frozenset({"call.requested", "call.replayed", "call.replay_d
                                "call.late_result_discarded"})
 
 
+def _is_state_event(e: Any) -> bool:
+    return bool(e.kind.startswith("call.") and e.kind not in _NON_STATE_EVENTS)
+
+
 def _row_backed_by_events(row: Any, events: list[Any]) -> list[str]:
     """The call row isn't hash-chained; its state and approval must agree with events that are."""
     problems = []
-    states = [e for e in events if e.kind.startswith("call.") and e.kind not in _NON_STATE_EVENTS]
+    states = [e for e in events if _is_state_event(e)]
     if not states or states[-1].kind != f"call.{row.state}":
         problems.append("stored state is not backed by the audit log")
     if row.approval is not None:
         approved = [e for e in events if e.kind == "call.approved"]
         if not approved or approved[-1].data.get("approval_digest") != approval_digest(row.approval):
             problems.append("stored approval is not backed by the audit log")
+    # Every other field a receipt reports must equal what the last change that set it recorded.
+    expected = {k: field_digest(v) for k, v in BACKED_FIELDS.items()}
+    if states:
+        expected["reason"] = field_digest(states[0].data.get("reason", ""))  # set when the call was created
+    for e in states:
+        recorded = e.data.get("row")
+        if isinstance(recorded, dict):
+            expected.update({k: v for k, v in recorded.items() if k in expected})
+    for name, digest in expected.items():
+        if field_digest(getattr(row, name)) != digest:
+            problems.append(f"stored {name} is not backed by the audit log")
     return problems
 
 

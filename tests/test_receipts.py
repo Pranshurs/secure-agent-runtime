@@ -218,3 +218,27 @@ def test_malformed_receipts_get_a_verdict_not_a_crash(refunded, mangle):
     r = rt.receipt(key, signing_key=KEY)
     mangle(r)
     assert verify_receipt(r, signing_key=KEY, store=rt.store)  # some problem, and no exception
+
+
+@pytest.mark.parametrize("column,value", [
+    ("frame_result_json", None),                 # a violated frame quietly dropped
+    ("result_json", '{"files_written":[]}'),     # a different result
+    ("result_digest", "'sha256:' || hex(randomblob(32))"),
+    ("before_json", None),
+    ("dispatches", 7),
+    ("reason", "'all good'"),
+], ids=["frame_result", "result", "result_digest", "before", "dispatches", "reason"])
+def test_one_edit_to_any_reported_row_field_fails_against_the_store(tmp_path, store, column, value):
+    """A receipt rebuilt from an edited row is self-consistent, so verifying it against the
+    store must catch the edit: every field it reports is backed by the audit event that set it."""
+    rt, key = vb.run(vb.sloppy_agent, tmp_path, store)
+    assert verify_receipt(rt.receipt(key), expect_key=key, store=store) == []
+    with store.tx() as db:
+        if value is None or isinstance(value, int):
+            db.execute(f"UPDATE calls SET {column}=? WHERE key=?", (value, key))
+        elif value.startswith("'") or "randomblob" in value:
+            db.execute(f"UPDATE calls SET {column}={value} WHERE key=?", (key,))
+        else:
+            db.execute(f"UPDATE calls SET {column}=? WHERE key=?", (value, key))
+    problems = verify_receipt(rt.receipt(key), expect_key=key, store=store)
+    assert any("not backed by the audit log" in p for p in problems), problems

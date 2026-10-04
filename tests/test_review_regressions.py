@@ -413,6 +413,20 @@ def test_a_store_that_fails_to_open_closes_its_connection_and_lock(tmp_path, mon
     Store(path).close()  # the file lock was released too
 
 
+def test_a_symlink_to_an_owned_database_cannot_open_a_second_store(tmp_path):
+    from secure_agent_runtime.errors import StoreLocked
+
+    real = tmp_path / "real.db"
+    link = tmp_path / "link.db"
+    with Store(str(real)):
+        link.symlink_to(real)
+        with pytest.raises(StoreLocked):
+            Store(str(link))
+    with Store(str(link)):  # once the owner is gone, either name works
+        with pytest.raises(StoreLocked):
+            Store(str(real))
+
+
 def test_store_ownership_follows_who_created_it(tmp_path):
     """A store a factory creates belongs to the runtime and closes with it; a store the
     caller passes in is never closed by the runtime."""
@@ -547,3 +561,120 @@ def test_s1_concurrent_executes_never_raise(store):
         t.join(60)
     assert errors == []
     assert {store.get_call(k).state for k in keys} <= {"succeeded", "failed"}
+
+
+# -- nothing between the claim and the recorded result may leave an action stuck in executing ----- #
+
+def _observed_runtime(store, observer, isolation="thread"):
+    from pydantic import BaseModel, ConfigDict
+
+    from secure_agent_runtime import Effect, Policy, Principal, Runtime, ToolRegistry
+    from secure_agent_runtime.auth import TokenAuthenticator
+
+    from . import process_tools as pt
+
+    class M(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        mode: str
+
+    calls: list[str] = []
+    reg = ToolRegistry()
+    if isolation == "process":
+        reg.tool(name="t", input=pt.In, output=pt.Out, effect=Effect.EXTERNAL, isolation="process")(pt.tool)
+    else:
+        frame = (lambda a: FrameSpec(allowed=("**",))) if observer else None
+        reg.tool(name="t", input=M, output=M, effect=Effect.EXTERNAL, observer=observer,
+                 frame=frame)(lambda a: calls.append(a.mode) or a)
+    rt = Runtime(registry=reg, policy=Policy(require_approval_for_effects=frozenset()), store=store,
+                 authenticator=TokenAuthenticator(), principals=[Principal("p", grants=frozenset({"t"}))])
+    o = rt.propose(run_id="r", principal_id="p", call_id="c", tool="t", arguments={"mode": "ok"})
+    return rt, o, calls
+
+
+def test_a_worker_thread_that_cannot_start_fails_the_action_instead_of_wedging_it(store, monkeypatch):
+    rt, o, calls = _observed_runtime(store, None)
+    real_start = threading.Thread.start
+
+    def no_threads(self):
+        if self.name.startswith("sar-tool-"):
+            raise RuntimeError("can't start new thread")
+        return real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", no_threads)
+    out = rt.execute(o.key)
+    assert out.state == "failed" and "did not run" in out.reason and calls == []
+    monkeypatch.undo()
+    assert rt.execute(o.key).state == "failed" and calls == []  # settled; nothing re-dispatches
+    assert rt.store.verify_audit()[0]
+
+
+def test_a_worker_process_that_cannot_start_fails_the_action_instead_of_wedging_it(store, monkeypatch):
+    from secure_agent_runtime import isolation
+
+    rt, o, _ = _observed_runtime(store, None, isolation="process")
+
+    def no_processes(self, *a, **kw):
+        raise OSError("cannot fork")
+
+    monkeypatch.setattr(isolation.Worker, "__init__", no_processes)
+    out = rt.execute(o.key)
+    assert out.state == "failed" and "did not run" in out.reason
+
+
+class _Observer:
+    """A custom observer whose snapshots are malformed (values aren't Entry objects)."""
+
+    def __init__(self, bad_on_call: int) -> None:
+        self.n, self.bad_on_call = 0, bad_on_call
+
+    def snapshot(self):
+        from secure_agent_runtime.effects import Entry
+
+        self.n += 1
+        return {"x": "not an Entry"} if self.n == self.bad_on_call else {"x": Entry("sha256:" + "0" * 64, b"")}
+
+
+def test_a_malformed_snapshot_after_dispatch_is_unverifiable_not_stuck(store):
+    rt, o, calls = _observed_runtime(store, _Observer(bad_on_call=2))
+    out = rt.execute(o.key)
+    assert out.state == "succeeded" and out.verification == "unverifiable" and calls == ["ok"]
+    assert rt.receipt(o.key)["outcome"] == "unverifiable"
+
+
+def test_a_malformed_snapshot_before_dispatch_blocks_the_tool(store):
+    rt, o, calls = _observed_runtime(store, _Observer(bad_on_call=1))
+    out = rt.execute(o.key)
+    assert out.state == "cancelled" and "could not observe" in out.reason and calls == []
+
+
+def test_editing_the_rows_principal_cannot_dodge_a_revoked_grant(tmp_path):
+    """Policy is re-checked at dispatch for the row's principal. That column must match the
+    actor in the signed action, or one edit would swap in a principal who still has the grant."""
+    from pydantic import BaseModel, ConfigDict
+
+    from secure_agent_runtime import Effect, Policy, Principal, Runtime, ToolRegistry
+    from secure_agent_runtime.auth import TokenAuthenticator
+
+    class M(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        n: int
+
+    calls: list[int] = []
+    reg = ToolRegistry()
+    reg.tool(name="t", input=M, output=M, effect=Effect.WRITE)(lambda a: calls.append(a.n) or a)
+
+    def runtime(store, p1_grants):
+        return Runtime(registry=reg, policy=Policy(), store=store, authenticator=TokenAuthenticator(),
+                       principals=[Principal("p1", grants=p1_grants), Principal("p2", grants=frozenset({"t"})),
+                                   Principal("boss", can_approve=True)])
+
+    with Store(str(tmp_path / "sar.db")) as store:
+        rt = runtime(store, frozenset({"t"}))
+        o = rt.propose(run_id="r", principal_id="p1", call_id="c", tool="t", arguments={"n": 1})
+        rt.approve(o.key, credential=cred(rt, "boss"), action_digest=o.action_digest)
+        rt.close()
+        rt = runtime(store, frozenset())  # the operator revokes p1's grant
+        with store.tx() as db:
+            db.execute("UPDATE calls SET principal='p2' WHERE key=?", (o.key,))
+        out = rt.execute(o.key)
+        assert out.state == "cancelled" and "does not match its action" in out.reason and calls == []

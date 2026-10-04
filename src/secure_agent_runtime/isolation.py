@@ -9,6 +9,12 @@ On Linux the worker asks the kernel to SIGKILL it if the runtime dies
 (``PR_SET_PDEATHSIG``), so a crashed runtime does not leave an orphan that could still
 act after recovery has reconciled. Other platforms have no equivalent; there an orphan
 worker can outlive the runtime (documented in the threat model).
+
+Each worker leads its own process group (POSIX ``setsid``). The runtime kills the whole
+group on timeout, when the worker dies, and as soon as the worker's one message has
+arrived, so neither a child process the tool started nor a thread it left running can act
+after the attempt is decided. Work handed to something outside the group (a daemon,
+another host) is beyond this.
 """
 
 from __future__ import annotations
@@ -44,6 +50,8 @@ def _worker(conn: Connection, parent_pid: int, token: str, fn: Any, input_model:
             args_json: str, ctx_fields: dict[str, Any], takes_ctx: bool) -> None:
     from .contracts import EffectNotApplied, ToolContext  # imported in the child
 
+    if hasattr(os, "setsid"):
+        os.setsid()  # lead a new process group, so the runtime can kill everything the tool starts
     _die_with_parent(parent_pid)
     try:
         model = input_model.model_validate_json(args_json, strict=True)
@@ -94,16 +102,25 @@ class Worker:
                 return WorkerResult("timeout")
             kind, token, payload = self._recv.recv()
         except (EOFError, OSError):
-            self.process.join(5)
+            self.kill()  # anything the dead worker started goes with it
             return WorkerResult("died", f"exit code {self.process.exitcode}")
         finally:
             self._recv.close()
-        self.process.join(5)
+        # The attempt is decided by this message. Kill the group before reaping the worker (its
+        # pid can't have been reused yet), so a lingering thread or child can't act afterwards.
+        self.kill()
         if token != self.token:  # a message for some other attempt is never accepted
             return WorkerResult("wrong_token")
         return WorkerResult(kind, payload)
 
     def kill(self) -> None:
+        """SIGKILL the worker's whole process group, then reap the worker."""
+        pid = self.process.pid
+        if pid is not None and hasattr(os, "killpg"):
+            try:
+                os.killpg(pid, signal.SIGKILL)  # the group the worker leads (setsid)
+            except (ProcessLookupError, PermissionError):
+                pass  # the group is already empty
         if self.process.is_alive():
-            self.process.kill()
+            self.process.kill()  # it died before setsid, or the platform has no groups
         self.process.join(5)

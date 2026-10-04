@@ -470,9 +470,11 @@ class Runtime:
             return Outcome.of(row)
 
         before: Snapshot | None = None
+        before_digests: dict[str, str] | None = None
         if spec.observer is not None:
             try:
                 before = spec.observer.snapshot()
+                before_digests = digests(before)  # also rejects a malformed snapshot, before the claim
             except Exception as exc:
                 self.store.transition(key, "approved", "cancelled",
                                       reason=f"could not observe state before dispatch: {type(exc).__name__}")
@@ -483,7 +485,7 @@ class Runtime:
         # Fenced on the dispatch count read above, so an executor holding a stale row can't
         # claim an action that was dispatched, reconciled and re-approved in the meantime.
         if not self.store.transition(key, "approved", "executing", attempt=row.dispatches, dispatches=attempt,
-                                     before=digests(before) if before is not None else None,
+                                     before=before_digests,
                                      event={"action_digest": row.action_digest, "attempt": attempt}):
             return Outcome.of(self._get(key))
         if before is not None:
@@ -545,7 +547,14 @@ class Runtime:
         worker = threading.Thread(target=work, name=f"sar-tool-{spec.name}", daemon=True)
         with self._mem:
             self._live[key] = worker
-        worker.start()
+        try:
+            worker.start()
+        except BaseException as exc:  # e.g. "can't start new thread": the tool did not run
+            self._release_worker(key, worker)
+            self._not_started(key, attempt, exc)
+            if not isinstance(exc, Exception):
+                raise
+            return Outcome.of(self._get(key))
         worker.join(spec.timeout_s)
         if worker.is_alive():
             ctx.cancel.set()
@@ -568,9 +577,15 @@ class Runtime:
         from .isolation import Worker
 
         token = f"{action.action_id}#{attempt}"
-        worker = Worker(token, spec.fn, spec.input_model, canonical_json(model.model_dump(mode="json")),
-                        {"action_id": action.action_id, "idempotency_key": key, "attempt": attempt},
-                        spec.takes_ctx)
+        try:
+            worker = Worker(token, spec.fn, spec.input_model, canonical_json(model.model_dump(mode="json")),
+                            {"action_id": action.action_id, "idempotency_key": key, "attempt": attempt},
+                            spec.takes_ctx)
+        except BaseException as exc:  # the process could not be started: the tool did not run
+            self._not_started(key, attempt, exc)
+            if not isinstance(exc, Exception):
+                raise
+            return
         with self._mem:
             self._live[key] = worker
         self._faults("after_spawn", key)
@@ -603,6 +618,13 @@ class Runtime:
         else:  # died
             finish(unknown, reason=f"worker process died ({res.payload})")
 
+    def _not_started(self, key: str, attempt: int, exc: BaseException) -> None:
+        """The claim is committed but no worker could be started, so the tool never ran."""
+        self._forget_snapshot(key)
+        self.store.transition(key, "executing", "failed", attempt=attempt,
+                              reason=f"could not start the worker ({type(exc).__name__}); the tool did not run")
+        log.warning("action %s: could not start a worker (%s)", key, type(exc).__name__)
+
     def _frame_result(self, spec: ToolSpec, action: Action, key: str, attempt: int) -> dict[str, Any] | None:
         if spec.observer is None or action.frame is None:
             return None
@@ -618,7 +640,10 @@ class Runtime:
             after = spec.observer.snapshot()
         except Exception as exc:
             return {**_UNVERIFIABLE, "note": f"observer raised {type(exc).__name__}"}
-        return check_frame(FrameSpec.from_json(action.frame), before, after).to_json()
+        try:  # a custom observer may return a malformed snapshot: never let that wedge the action
+            return check_frame(FrameSpec.from_json(action.frame), before, after).to_json()
+        except Exception as exc:
+            return {**_UNVERIFIABLE, "note": f"frame check failed ({type(exc).__name__})"}
 
     def _pre_execution_check(self, row: CallRow) -> tuple[str | None, ToolSpec | None, BaseModel | None,
                                                           Action | None]:
@@ -634,6 +659,10 @@ class Runtime:
             return ("stored action is unreadable", *none)
         if stored.digest != row.action_digest:
             return ("stored action does not match its digest", *none)
+        # The row's own columns drive policy below; they must be the ones the digest covers.
+        if (row.principal, row.tool, row.run_id, row.key) != (stored.actor, stored.tool, stored.run_id,
+                                                                stored.idempotency_key):
+            return ("stored row does not match its action", *none)
         if not row.approval or row.approval.get("action_digest") != row.action_digest:
             return ("approval does not match the stored action", *none)
         if not self._approval_is_audited(row):

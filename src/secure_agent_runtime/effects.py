@@ -70,8 +70,16 @@ class FileTreeObserver:
         self._ignore = [compile_glob(g) for g in ignore]
 
     def snapshot(self) -> Snapshot:
+        # Fail closed: a missing root (a typo, an unmounted volume) or a directory that can't
+        # be read must not look like "nothing there", or a deletion would read as verified.
+        if not self.root.is_dir():
+            raise FileNotFoundError(f"observer root {self.root} is not a directory")
+
+        def unreadable(exc: OSError) -> None:
+            raise exc
+
         snap: Snapshot = {}
-        for dirpath, dirnames, filenames in os.walk(self.root, followlinks=False):
+        for dirpath, dirnames, filenames in os.walk(self.root, followlinks=False, onerror=unreadable):
             dirnames.sort()
             for name in sorted(filenames) + sorted(dirnames):
                 full = Path(dirpath, name)

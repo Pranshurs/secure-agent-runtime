@@ -59,6 +59,26 @@ def test_credential_scoped_to_another_action_is_refused(rt, app):
     assert rt.execute(b.key).state == "awaiting_approval"
 
 
+def test_an_approval_that_loses_a_race_does_not_burn_the_credential(rt):
+    """The action is cancelled between reading it and the approval's compare-and-set
+    (forced here inside authentication). The approval is refused and the credential stays
+    unused, so the approver can still use it."""
+    a, b = pending(rt, "a", "A"), pending(rt, "b", "B")
+    token = cred(rt, APPROVER)
+    real = rt.authenticator.authenticate
+
+    def cancel_first(credential):
+        rt.authenticator.authenticate = real
+        rt.cancel(a.key)  # a concurrent caller wins the race
+        return real(credential)
+
+    rt.authenticator.authenticate = cancel_first
+    with pytest.raises(ApprovalRefused, match="no longer awaiting approval"):
+        rt.approve(a.key, credential=token, action_digest=a.action_digest)
+    assert rt.store.get_call(a.key).state == "cancelled"
+    assert rt.approve(b.key, credential=token, action_digest=b.action_digest).state == "approved"
+
+
 def test_credential_replay_is_refused(rt):
     a, b = pending(rt, "a", "A"), pending(rt, "b", "B")
     token = cred(rt, APPROVER)
@@ -207,6 +227,24 @@ def test_old_receipt_after_state_change_is_stale(store):
     rf.approve_as_finance(rt, o)
     problems = verify_receipt(early, public_keys={"k": signer.public_key_bytes()}, store=rt.store)
     assert problems == ["stale receipt: the action changed after it was issued"]
+
+
+def test_events_that_change_nothing_do_not_make_a_receipt_stale(store):
+    """Anyone who can call the API can replay a call or attempt an approval. Those append
+    audit events but change nothing, so they must not invalidate receipts already issued."""
+    service = rf.PaymentService()
+    rt = rf.build_runtime(service, store, isolation="thread")
+    o = rt.propose(run_id="t", principal_id=rf.AGENT, call_id="c", tool="refund",
+                   arguments={"order": 1, "amount_inr": 1})
+    receipt = rt.receipt(o.key)
+    rt.propose(run_id="t", principal_id=rf.AGENT, call_id="c", tool="refund", arguments={"order": 1, "amount_inr": 1})
+    with pytest.raises(ApprovalRefused):
+        rt.approve(o.key, credential="not-a-credential", action_digest=o.action_digest)
+    assert {"call.replayed", "approval.refused"} <= {e.kind for e in store.events(call_key=o.key)}
+    assert verify_receipt(receipt, expect_key=o.key, store=store) == []
+    rf.approve_as_finance(rt, o)  # a real change still makes it stale
+    assert verify_receipt(receipt, expect_key=o.key, store=store) == [
+        "stale receipt: the action changed after it was issued"]
 
 
 def test_receipt_copied_to_another_action_fails(signed):

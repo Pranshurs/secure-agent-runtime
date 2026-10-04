@@ -293,3 +293,53 @@ def test_frame_and_observer_must_come_together():
     with pytest.raises(ContractError):
         ToolRegistry().tool(name="t", input=M, output=M, effect=Effect.WRITE, frame=lambda a: FrameSpec())(
             lambda a: M())
+
+
+# -- an observer that can't see must never report "verified" ---------------------------------------- #
+
+def test_a_mistyped_observer_root_blocks_the_tool_before_it_runs(tmp_path, store):
+    """With a typo in the root, the old observer saw an empty tree before and after, so even
+    deleting a forbidden directory read as 'verified'. Now the pre-dispatch snapshot fails."""
+    ws = vb.make_workspace(tmp_path / "ws")
+    rt = vb.build_runtime(ws, vb.sloppy_agent, store)
+    spec = rt.registry.get("bump_version")
+    rt.registry.replace(dataclasses.replace(spec, observer=FileTreeObserver(tmp_path / "wss")))  # typo
+    o = rt.propose(run_id="r", principal_id=vb.AGENT, call_id="c", tool="bump_version",
+                   arguments={"from_version": "2.1.0", "to_version": "2.1.1"})
+    if o.state == "awaiting_approval":
+        rt.approve(o.key, credential=cred(rt, vb.APPROVER), action_digest=o.action_digest)
+    out = rt.execute(o.key)
+    assert out.state == "cancelled" and "could not observe" in out.reason
+    assert (ws / "tests" / "test_pkg.py").exists()  # the tool never ran
+
+
+def test_an_observed_root_that_disappears_during_dispatch_is_never_verified(tmp_path, store):
+    import shutil
+
+    ws = vb.make_workspace(tmp_path / "ws")
+
+    def wipe(root, args):
+        shutil.rmtree(root)
+        return []
+
+    rt = vb.build_runtime(ws, wipe, store)
+    o = rt.propose(run_id="r", principal_id=vb.AGENT, call_id="c", tool="bump_version",
+                   arguments={"from_version": "2.1.0", "to_version": "2.1.1"})
+    rt.approve(o.key, credential=cred(rt, vb.APPROVER), action_digest=o.action_digest)
+    out = rt.execute(o.key)
+    assert out.state == "succeeded" and out.verification == "unverifiable"
+
+
+def test_an_unreadable_directory_makes_the_snapshot_fail(tmp_path, monkeypatch):
+    (tmp_path / "secret").mkdir()
+    (tmp_path / "secret" / "a").write_text("x")
+    real_scandir = os.scandir
+
+    def deny(path="."):
+        if os.fspath(path).endswith("secret"):
+            raise PermissionError(13, "Permission denied", os.fspath(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", deny)  # what os.walk sees for a directory it can't read
+    with pytest.raises(PermissionError):
+        FileTreeObserver(tmp_path).snapshot()

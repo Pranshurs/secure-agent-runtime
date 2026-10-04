@@ -140,6 +140,17 @@ def approval_digest(approval: dict[str, Any]) -> str:
     return "sha256:" + hashlib.sha256(canonical_json(approval).encode("utf-8")).hexdigest()
 
 
+def field_digest(value: Any) -> str:
+    """Digest of one call-row field, recorded in the audit event of the change that set it."""
+    return "sha256:" + hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+# Row fields whose every change is recorded (as a digest) in that change's audit event, with
+# the value a new row starts with. The approval is backed separately (approval_digest).
+BACKED_FIELDS: dict[str, Any] = {"result": None, "result_digest": None, "frame_result": None, "before": None,
+                                 "dispatches": 0}
+
+
 def _event_hash(prev_hash: str, seq: int, ts: float, run_id: str, call_key: str | None,
                 kind: str, data_json: str) -> str:
     body = canonical_json([seq, ts, run_id, call_key, kind, data_json])
@@ -200,8 +211,10 @@ class Store:
             import fcntl
         except ImportError as exc:  # pragma: no cover - non-POSIX
             raise StoreError("file-backed stores need POSIX fcntl locking; Windows is not supported") from exc
+        # Lock the resolved path, so a symlink to the same database can't take a second lock.
+        lock_path = os.path.realpath(self.path) + ".lock"
         try:
-            fd = os.open(self.path + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         except OSError as exc:
             raise StoreError(f"cannot create lock file for {self.path!r}: {exc}") from exc
         try:
@@ -391,17 +404,21 @@ class Store:
             if unexpired_at is not None:  # the approval window is re-checked inside the CAS
                 fence += " AND (expires_at IS NULL OR expires_at > ?)"
                 fence_args = (*fence_args, unexpired_at)
-            if consume_credential is not None:  # one use per credential, atomically with the change
-                try:
-                    db.execute("INSERT INTO credentials VALUES (?,?,?)", (consume_credential, key, self.now()))
-                except sqlite3.IntegrityError as exc:
-                    raise CredentialReused("this approval credential has already been used") from exc
             cur = db.execute(f"UPDATE calls SET {', '.join(cols)} WHERE key=? AND state=?{fence}",
                              (*values, key, from_state, *fence_args))
             if cur.rowcount != 1:
-                return False
+                return False  # nothing was written, so committing the empty transaction is harmless
+            if consume_credential is not None:  # one use per credential, atomically with the change
+                try:  # only after the change succeeded: a refused or raced attempt must not burn it
+                    db.execute("INSERT INTO credentials VALUES (?,?,?)", (consume_credential, key, self.now()))
+                except sqlite3.IntegrityError as exc:  # raising rolls the state change back too
+                    raise CredentialReused("this approval credential has already been used") from exc
             run_id = db.execute("SELECT run_id FROM calls WHERE key=?", (key,)).fetchone()["run_id"]
-            self._append(db, run_id, key, f"call.{to_state}", event or {})
+            data = dict(event or {})
+            backed = {k: field_digest(v) for k, v in fields.items() if k in BACKED_FIELDS or k == "reason"}
+            if backed:  # the row isn't hash-chained; its event records what this change wrote
+                data["row"] = backed
+            self._append(db, run_id, key, f"call.{to_state}", data)
             self._faults("before_commit", f"{from_state}->{to_state}")
         return True
 

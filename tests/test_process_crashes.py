@@ -233,3 +233,34 @@ def test_worker_outcomes_in_process_mode(store, mode, effect, expected, reason):
     assert out.state == expected and reason in out.reason
     assert "secret detail" not in str([e.data for e in store.events()])
     assert rt.execute(o.key).state == expected  # nothing re-dispatches on its own
+
+
+# -- nothing the tool left running can act after the attempt is decided ---------------------------- #
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are POSIX-only")
+@pytest.mark.parametrize("mode,expected", [("child", "effect_unknown"), ("thread", "succeeded")])
+def test_nothing_the_worker_left_running_acts_after_the_attempt_is_decided(store, tmp_path, mode, expected):
+    """'child': the tool starts a child process and then times out. 'thread': the tool returns
+    but leaves a thread running. Either way SAR kills the worker's whole process group once the
+    attempt is decided, so the leftover can't act later (it would act when 'release' appears)."""
+    from secure_agent_runtime.auth import TokenAuthenticator
+    from secure_agent_runtime.contracts import Effect, ToolRegistry
+    from secure_agent_runtime.policy import Policy, Principal
+    from secure_agent_runtime.runtime import Runtime
+
+    from . import process_tools as pt
+
+    reg = ToolRegistry()
+    reg.tool(name="t", input=pt.LateIn, output=pt.Out, effect=Effect.EXTERNAL, isolation="process",
+             timeout_s=8 if mode == "child" else 20)(pt.late_tool)
+    rt = Runtime(registry=reg, policy=Policy(require_approval_for_effects=frozenset()), store=store,
+                 authenticator=TokenAuthenticator(), principals=[Principal("p", grants=frozenset({"t"}))])
+    o = rt.propose(run_id="r", principal_id="p", call_id="c", tool="t", arguments={"mode": mode, "dir": str(tmp_path)})
+    assert rt.execute(o.key).state == expected
+    deadline = time.monotonic() + 10
+    while not (tmp_path / "started").exists() and time.monotonic() < deadline:  # the leftover really ran
+        time.sleep(0.05)
+    assert (tmp_path / "started").exists()
+    (tmp_path / "release").touch()
+    time.sleep(1.0)
+    assert not (tmp_path / "late_effect").exists()
