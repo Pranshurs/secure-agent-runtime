@@ -34,11 +34,12 @@ blocks dispatch.
 
 1. Diff the snapshots taken before dispatch and after the result. Each change is
    `added`, `modified` or `deleted`.
-2. **Forbidden** is checked first. A change matching a forbidden glob is forbidden, even
-   if it also matches a requirement.
+2. **Forbidden** is checked first, for every change. A change matching a forbidden glob
+   is forbidden even if it also matches a requirement, so a broad requirement can't
+   launder it.
 3. **Required**: each requirement needs exactly `count` matching changes of the right
    kind, with `before_contains` / `after_contains` holding. One change satisfies at most
-   one requirement.
+   one requirement (the first that matches it).
 4. Remaining changes are **allowed** if they match an allowed glob, otherwise
    **undeclared**.
 5. Verdict:
@@ -47,16 +48,19 @@ blocks dispatch.
      pre-dispatch content was lost in a crash;
    * otherwise `verified`.
 
-Globs are anchored. `*` and `?` stay inside one path segment; `**` crosses segments.
-Everything else is literal.
+Globs are anchored. `*` and `?` stay inside one path segment; `**` crosses segments
+and matches every character `*` can, including newlines. Everything else is literal.
 
 ## Observers
 
 * `FileTreeObserver(root, ignore=...)` records regular files (content and permission
   bits), directories (so an empty new directory shows), and symlinks by target text,
-  never followed. It does not see ownership, timestamps or extended attributes.
+  never followed. It does not see ownership, timestamps or extended attributes. A name
+  that isn't valid UTF-8 makes the snapshot fail. Before dispatch that blocks the call;
+  after dispatch it makes the verdict `unverifiable`. It is never reported as
+  verified.
 * `MappingObserver(source)` takes any `{str id: JSON value}`: a ledger, a table, a
-  bucket listing.
+  bucket listing. Non-string ids are refused, so `1` and `"1"` can't collide.
 * Write your own by implementing `snapshot() -> {id: Entry(digest, content)}`.
 
 ## Demo

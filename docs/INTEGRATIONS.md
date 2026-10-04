@@ -6,6 +6,24 @@ mapping a framework's "the model wants to call a tool" into `Runtime.propose` /
 message. **No adapters are implemented yet.** This page records the plan and the facts
 that shape it (checked October 2026; see `docs/DESIGN_NOTES.md`).
 
+## Identity (required for approvals)
+
+Implement `Authenticator.authenticate(credential) -> AuthContext | None` over your
+identity provider: verify the signed token or session assertion, and return the subject
+(a principal id in the runtime's directory), the method, the issuer, a unique
+`credential_id`, and optionally `scope` (the action digest the person approved on screen)
+and `expires_at`. Mint one credential per approval click. SAR consumes `credential_id`,
+so it can't be replayed. `TokenAuthenticator` is a demo stand-in; don't use it to
+authenticate people.
+
+## Observability
+
+Install the `otel` extra (or `opentelemetry-api` yourself) plus your SDK and exporter.
+SAR emits spans for propose, approve, reject, cancel, reconcile, resolve and receipt,
+plus `execute_tool <tool>` spans with `gen_ai.operation.name=execute_tool`. It also
+records the metrics `sar.action.transitions` and `sar.dispatch.duration`. No argument
+values, results, credentials or idempotency keys are emitted. See `telemetry.py`.
+
 ## Generic Python (available now)
 
 ```python
