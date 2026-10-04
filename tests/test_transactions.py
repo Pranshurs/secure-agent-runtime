@@ -232,11 +232,14 @@ def test_undecided_reconciliation_keeps_the_action_unknown(service, store, behav
             return Applied({"refund_id": 5})
         return "yes it worked"
 
-    spec = rt.registry.get("refund")
-    rt.registry.replace(dataclasses.replace(spec, reconciler=recon, timeout_s=0.1))
+    spec = dataclasses.replace(rt.registry.get("refund"), reconciler=recon)
+    rt.registry.replace(spec)
     o = approved(rt)
     service.fail_next = "after_effect"
-    rt.execute(o.key)
+    assert rt.execute(o.key).state == "effect_unknown"  # the lost response, with the tool's normal timeout
+    # Only now bound the reconciler tightly: with 0.1 s for the dispatch too, a slow runner timed the
+    # dispatch out, the worker was still alive, and reconcile (correctly) deferred instead of deciding.
+    rt.registry.replace(dataclasses.replace(spec, timeout_s=0.1))
     t0 = time.monotonic()
     assert rt.reconcile(o.key).state == "effect_unknown"
     assert time.monotonic() - t0 < 0.8  # a hanging reconciler is bounded by the tool timeout
