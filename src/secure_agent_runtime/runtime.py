@@ -24,6 +24,7 @@ import json
 import logging
 import math
 import threading
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -52,6 +53,7 @@ from .effects import FrameSpec, Snapshot, check_frame, digests, from_digests
 from .errors import CredentialReused, SARError
 from .policy import Policy, Principal, Verdict, approval_refusal
 from .store import CallRow, Store, approval_digest
+from .telemetry import Telemetry
 
 POLICY_APPROVER = "policy:allow"
 MAX_ID_LEN = 256
@@ -122,6 +124,7 @@ class Runtime:
     def __init__(self, *, registry: ToolRegistry, policy: Policy, principals: Iterable[Principal],
                  store: Store, authenticator: Authenticator | None = None, approval_ttl_s: float = 3600.0,
                  max_stuck_workers: int = 32, recover_on_start: bool = True,
+                 telemetry: Telemetry | None = None,
                  faults: Callable[[str, str], None] | None = None) -> None:
         """``faults(point, key)`` is a fault-injection hook called at execution boundaries.
         Raising from it simulates a crash there: at ``after_claim`` the exception propagates
@@ -136,6 +139,7 @@ class Runtime:
         if approval_ttl_s <= 0:
             raise ValueError("approval_ttl_s must be positive")
         store.attach(self)
+        self.telemetry = telemetry if telemetry is not None else Telemetry.from_global()
         self.authenticator = authenticator
         self.max_stuck_workers = max_stuck_workers
         self.registry = registry
@@ -165,8 +169,75 @@ class Runtime:
     def principal(self, principal_id: str) -> Principal | None:
         return self._principals.get(principal_id)
 
-    # -- proposals ---------------------------------------------------------------- #
+    # -- public operations: traced wrappers (telemetry can't change their result) ---- #
     def propose(self, *, run_id: str, principal_id: str, call_id: Any, tool: Any, arguments: Any,
+                idempotency_key: str | None = None, deadline: float | None = None) -> Outcome:
+        """Turn a proposal into a recorded action (see :meth:`_propose`)."""
+        with self.telemetry.span("sar.propose", **{"sar.run_id": run_id if isinstance(run_id, str) else None}) as sp:
+            o = self._propose(run_id=run_id, principal_id=principal_id, call_id=call_id, tool=tool,
+                              arguments=arguments, idempotency_key=idempotency_key, deadline=deadline)
+            self._observe(sp, o)
+            return o
+
+    def approve(self, key: str, *, credential: Any, action_digest: str) -> Outcome:
+        """Approve exactly the action whose digest the approver was shown (see :meth:`_approve`)."""
+        with self.telemetry.span("sar.approve", **{"sar.action_id": action_id_for(key)}) as sp:
+            o = self._approve(key, credential=credential, action_digest=action_digest)
+            self._observe(sp, o)
+            return o
+
+    def reject(self, key: str, *, credential: Any, reason: str = "") -> Outcome:
+        with self.telemetry.span("sar.reject", **{"sar.action_id": action_id_for(key)}) as sp:
+            o = self._reject(key, credential=credential, reason=reason)
+            self._observe(sp, o)
+            return o
+
+    def cancel(self, key: str, *, reason: str = "cancelled") -> Outcome:
+        """Cancel (or revoke the approval of) an action that has not been dispatched."""
+        with self.telemetry.span("sar.cancel", **{"sar.action_id": action_id_for(key)}) as sp:
+            o = self._cancel(key, reason=reason)
+            self._observe(sp, o)
+            return o
+
+    def execute(self, key: str) -> Outcome:
+        """Dispatch an approved action; any other state returns the stored outcome (see :meth:`_execute`)."""
+        row = self._get(key)
+        spec = self.registry.get(row.tool)
+        attrs = {"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": row.tool, "sar.tool": row.tool,
+                 "sar.action_id": action_id_for(key), "sar.run_id": row.run_id, "sar.attempt": row.dispatches + 1,
+                 "sar.isolation": spec.isolation if spec else None, "sar.tool.version": spec.version if spec else None}
+        started = time.monotonic()
+        with self.telemetry.span(f"execute_tool {row.tool}", **attrs) as sp:
+            o = self._execute(key)
+            self._observe(sp, o)
+            if row.state == "approved" and o.state != "approved":
+                self.telemetry.dispatch_duration(o.tool, o.state, started)
+            return o
+
+    def reconcile(self, key: str) -> Outcome:
+        """Settle an ``effect_unknown`` action through the tool's reconciler (see :meth:`_reconcile`)."""
+        with self.telemetry.span("sar.reconcile", **{"sar.action_id": action_id_for(key)}) as sp:
+            o = self._reconcile(key)
+            self._observe(sp, o)
+            sp.set("sar.reconcile.finding", {"succeeded": "applied", "approved": "not_applied"}.get(o.state, "unknown"))
+            return o
+
+    def resolve(self, key: str, *, credential: Any, applied: bool, result: Any = None,
+                redispatch: bool = False) -> Outcome:
+        """A human's verdict on an ``effect_unknown`` action (see :meth:`_resolve`)."""
+        with self.telemetry.span("sar.resolve", **{"sar.action_id": action_id_for(key)}) as sp:
+            o = self._resolve(key, credential=credential, applied=applied, result=result, redispatch=redispatch)
+            self._observe(sp, o)
+            return o
+
+    def _observe(self, sp: Any, o: Outcome) -> None:
+        sp.set("sar.tool", o.tool)
+        sp.set("sar.state", o.state)
+        sp.set("sar.frame.verdict", o.verification)
+        self.telemetry.transition(o.tool, o.state)
+
+    # -- proposals ---------------------------------------------------------------- #
+    def _propose(self, *, run_id: str, principal_id: str, call_id: Any, tool: Any, arguments: Any,
                 idempotency_key: str | None = None, deadline: float | None = None) -> Outcome:
         """Turn a proposal into a recorded action. ``idempotency_key`` defaults to
         ``(run_id, call_id)``; pass your own to dedupe across runs."""
@@ -279,7 +350,7 @@ class Runtime:
         self.store.record(row.run_id, "approval.refused", {"reason": reason, **data}, call_key=row.key)
         return ApprovalRefused(reason)
 
-    def approve(self, key: str, *, credential: Any, action_digest: str) -> Outcome:
+    def _approve(self, key: str, *, credential: Any, action_digest: str) -> Outcome:
         """Approve exactly the action whose digest the approver was shown.
 
         ``credential`` is authenticated by the operator's :class:`Authenticator`; the
@@ -308,7 +379,7 @@ class Runtime:
                                approver=ctx.subject)
         return Outcome.of(self._get(key))
 
-    def reject(self, key: str, *, credential: Any, reason: str = "") -> Outcome:
+    def _reject(self, key: str, *, credential: Any, reason: str = "") -> Outcome:
         row = self._get(key)
         ctx = self._authenticate(credential, row.action_digest)
         if isinstance(ctx, str):
@@ -338,7 +409,7 @@ class Runtime:
                 expired.append(row.key)
         return expired
 
-    def cancel(self, key: str, *, reason: str = "cancelled") -> Outcome:
+    def _cancel(self, key: str, *, reason: str = "cancelled") -> Outcome:
         """Cancel (or revoke the approval of) an action that has not been dispatched."""
         row = self._get(key)
         if row.state in ("awaiting_approval", "approved"):
@@ -346,7 +417,7 @@ class Runtime:
         return Outcome.of(self._get(key))
 
     # -- execution ---------------------------------------------------------------- #
-    def execute(self, key: str) -> Outcome:
+    def _execute(self, key: str) -> Outcome:
         """Dispatch an approved action. Any other state returns the stored outcome without
         touching the tool."""
         row = self._get(key)
@@ -566,7 +637,7 @@ class Runtime:
                 and latest.data.get("approval_digest") == approval_digest(row.approval))
 
     # -- uncertain outcomes ------------------------------------------------------- #
-    def reconcile(self, key: str) -> Outcome:
+    def _reconcile(self, key: str) -> Outcome:
         """Ask the tool's reconciler whether an ``effect_unknown`` action took effect.
 
         Applied -> ``succeeded`` with the reconciled result. NotApplied -> ``approved``,
@@ -626,7 +697,7 @@ class Runtime:
             self.store.record(row.run_id, "reconcile.unknown", {"why": (why or "undecided")[:200]}, call_key=key)
         return Outcome.of(self._get(key))
 
-    def resolve(self, key: str, *, credential: Any, applied: bool, result: Any = None,
+    def _resolve(self, key: str, *, credential: Any, applied: bool, result: Any = None,
                 redispatch: bool = False) -> Outcome:
         """A human's verdict on an ``effect_unknown`` action, for tools with no reconciler.
 
@@ -713,7 +784,11 @@ class Runtime:
         """A machine-verifiable Agent Receipt for one action (see ``receipts``)."""
         from .receipts import build_receipt
 
-        return build_receipt(self.store, key, signer=signer, signing_key=signing_key, key_id=key_id)
+        with self.telemetry.span("sar.receipt", **{"sar.action_id": action_id_for(key)}) as sp:
+            r = build_receipt(self.store, key, signer=signer, signing_key=signing_key, key_id=key_id)
+            sp.set("sar.outcome", r["outcome"])
+            sp.set("sar.signature.alg", (r.get("signature") or {}).get("alg"))
+            return r
 
     def _get(self, key: str) -> CallRow:
         row = self.store.get_call(key)
