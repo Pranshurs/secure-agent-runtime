@@ -182,11 +182,18 @@ class Store:
             self._db.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
             self._migrate()
         except (sqlite3.Error, OSError) as exc:
-            self._release_file_lock()
+            self._abandon_open()
             raise StoreError(f"cannot open SAR database {path!r}: {exc}") from exc
         except BaseException:
-            self._release_file_lock()
+            self._abandon_open()
             raise
+
+    def _abandon_open(self) -> None:
+        db = getattr(self, "_db", None)
+        if db is not None:
+            db.close()
+        self.closed = True
+        self._release_file_lock()
 
     def _take_file_lock(self) -> None:
         try:

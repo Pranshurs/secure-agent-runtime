@@ -36,6 +36,12 @@ def test_a1_forbidden_double_star_matches_paths_with_newlines():
 # -- A2: a result that can't be stored must not wedge the action ------------------------------ #
 
 def test_a2_unstorable_frame_result_does_not_leave_the_action_executing(tmp_path):
+    try:  # APFS (macOS) refuses names that aren't valid UTF-8; ext4 and most others accept the bytes
+        (tmp_path / "probe\udcff").write_bytes(b"")
+    except OSError as exc:
+        pytest.skip(f"this filesystem refuses non-UTF-8 file names ({exc.strerror})")
+    (tmp_path / "probe\udcff").unlink()
+
     def evil(root, args):
         vb.careful_agent(root, args)
         (root / "bad\udcff").write_bytes(b"x")  # surrogateescape'd non-UTF-8 name
@@ -369,10 +375,41 @@ def test_b8_unknown_schema_version_is_refused(tmp_path):
 
     s = Store(str(tmp_path / "sar.db"))
     s.close()
-    with sqlite3.connect(str(tmp_path / "sar.db")) as db:
-        db.execute("PRAGMA user_version=99")
+    db = sqlite3.connect(str(tmp_path / "sar.db"))
+    db.execute("PRAGMA user_version=99")
+    db.close()
     with pytest.raises(StoreError, match="schema version 99"):
         Store(str(tmp_path / "sar.db"))
+
+
+def test_a_store_that_fails_to_open_closes_its_connection_and_lock(tmp_path, monkeypatch):
+    import sqlite3
+
+    from secure_agent_runtime.errors import StoreError
+
+    path = str(tmp_path / "sar.db")
+    Store(path).close()
+    db = sqlite3.connect(path)
+    db.execute("PRAGMA user_version=99")
+    db.close()
+    opened: list[sqlite3.Connection] = []
+    real_connect = sqlite3.connect
+
+    def spy(*a, **kw):
+        opened.append(real_connect(*a, **kw))
+        return opened[-1]
+
+    monkeypatch.setattr(sqlite3, "connect", spy)
+    with pytest.raises(StoreError):
+        Store(path)
+    assert len(opened) == 1
+    with pytest.raises(sqlite3.ProgrammingError):  # "Cannot operate on a closed database."
+        opened[0].execute("SELECT 1")
+    monkeypatch.undo()
+    db = sqlite3.connect(path)
+    db.execute("PRAGMA user_version=1")
+    db.close()
+    Store(path).close()  # the file lock was released too
 
 
 def test_b8_closed_store_raises_a_store_error(store):

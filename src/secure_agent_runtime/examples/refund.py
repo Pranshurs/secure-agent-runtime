@@ -14,11 +14,13 @@ then killed) is visible to whoever looks next, as with a real provider.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import os
 import sqlite3
 import tempfile
 import time
+from collections.abc import Iterator
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -64,10 +66,19 @@ class PaymentService:
                        " amount_inr INTEGER, idempotency_key TEXT)")
             db.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
 
-    def _db(self) -> sqlite3.Connection:
+    def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=30, isolation_level=None)
         db.execute("PRAGMA busy_timeout=30000")
         return db
+
+    @contextlib.contextmanager
+    def _db(self) -> Iterator[sqlite3.Connection]:
+        # sqlite3's own context manager commits but never closes; close explicitly.
+        db = self._connect()
+        try:
+            yield db
+        finally:
+            db.close()
 
     def _take(self, db: sqlite3.Connection, k: str) -> str | None:
         row = db.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
@@ -111,7 +122,7 @@ class PaymentService:
         time.sleep(30)
 
     def refund(self, order: int, amount_inr: int, idempotency_key: str | None = None) -> str:
-        db = self._db()
+        db = self._connect()
         try:
             db.execute("BEGIN IMMEDIATE")
             calls = db.execute("SELECT v FROM meta WHERE k='calls'").fetchone()
