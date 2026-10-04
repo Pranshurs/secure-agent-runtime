@@ -130,18 +130,21 @@ proposal → canonicalization → authority → exact-argument approval → dura
   hash-chained audit event commit together. A crash leaves `executing` rows that become
   `effect_unknown` on restart; nothing is re-dispatched automatically.
 * **Killable workers.** A tool declared `isolation="process"` runs in a fresh worker
-  process per attempt. On timeout the worker is killed, so it can't finish its effect
-  later; its messages carry the attempt's token. On Linux a worker also dies with its
-  runtime.
+  process per attempt, leading its own process group. The group is killed on timeout, if
+  the worker dies, and as soon as its one reply arrives, so neither the worker nor a
+  child process or thread it left behind can act after the attempt is decided. Its
+  message carries the attempt's token. On Linux a worker also dies with its runtime.
 * **Reconciliation.** `effect_unknown` means "the tool may have acted and we don't know".
   Only the tool's reconciler (or an authenticated person, `resolve`) leaves it: applied →
-  `succeeded`; not applied → `approved`, eligible for one more dispatch.
+  `succeeded`; not applied → `approved`, so the same approval may dispatch again (within
+  its time limit, `approval_ttl_s`).
 * **Frame conditions.** An observer snapshots what the tool may touch before and after.
   The operator declares required, allowed and forbidden changes; anything undeclared
   fails. See [docs/FRAME_CONDITIONS.md](docs/FRAME_CONDITIONS.md).
 * **Agent Receipts.** JSON with a published schema: the action envelope (argument values
-  only as salted digests), the decision, the authenticated approval, execution, result
-  digest, observed versus declared effects and the audit events. Signed with Ed25519 (or
+  only as a salted digest), the decision, the authenticated approval, execution, result
+  digest, observed versus declared effects and the audit events. Every row field a
+  receipt reports is backed by the audit event that set it. Signed with Ed25519 (or
   HMAC), and verifiable against the store. See [docs/AGENT_RECEIPTS.md](docs/AGENT_RECEIPTS.md).
 * **Telemetry (optional).** OpenTelemetry spans and metrics without argument values,
   results or credentials. A failing exporter can't change a decision.
@@ -163,9 +166,10 @@ and a process-isolated tool can still touch whatever its process can reach. SAR 
 *whether* and *how many times* a call runs and records *what it changed*. Run tools inside
 a sandbox. See [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md).
 
-It is **not exactly-once.** It gives at most one dispatch per approval and never
+It is **not exactly-once.** It gives at most one dispatch per approved attempt, starts
+another attempt only when the previous one is known to have had no effect, and never
 re-dispatches an unknown outcome. That becomes "exactly one effect" only when the tool
-can be reconciled. It is not formally verified, and it is not secure against a
+can be reconciled truthfully. It is not formally verified, and it is not secure against a
 compromised host.
 
 ## Guarantees and their evidence
@@ -257,10 +261,18 @@ after a crash. **Windows is not supported** for file-backed stores (no `fcntl` l
   attempt (see the benchmark) and needs an importable, module-level tool.
 * **At most once per approval, not exactly once.** Without a reconciler, an uncertain
   outcome waits for a person (`resolve`).
-* **One process per database.** A file lock refuses a second owner. Several processes
-  sharing one store are not supported yet; shard by database instead.
+* **One process per database, on a local file system.** A file lock (on the resolved
+  path, so symlinks count) refuses a second owner. Hard links, bind mounts and network
+  file systems are not detected. Several processes sharing one store are not supported
+  yet; shard by database instead. Close what you open: a `Store` dropped without
+  `close()` keeps its lock until the process exits.
+* **Process isolation stops the worker's process group,** not work it handed to
+  something else (a daemon, another service, another host).
 * **Frame conditions detect; they don't prevent or undo,** and only within what the
   observer snapshots, at two instants. Concurrent writers show up as violations.
+* **Some digests are unsalted.** The argument digest in a receipt is salted per action;
+  the result digest and the observed-state digests are not, so a low-entropy result can
+  be guessed from its receipt.
 * **Tamper-evident, not tamper-proof.** Someone with full write access to the database
   can rebuild it consistently. Truncation is caught only against a chain head you keep
   elsewhere (`store.head()`). HMAC receipts are symmetric. Key management (rotation,

@@ -68,7 +68,9 @@ A receipt issued before the action changed again (for example, while it was
 
 Argument values and tool output are present only as digests. The argument digest is
 salted per action, so a low-entropy value such as an amount can't be recovered by
-trying candidates. Two things can still reveal content:
+trying candidates. The **result digest and the observed-state digests are not salted**,
+so a low-entropy result (a balance, a yes/no) can be guessed by hashing candidates. Two
+more things can reveal content:
 
 * The **declared frame** is operator text and may quote argument values. The refund demo
   puts the amount in `after_contains`.

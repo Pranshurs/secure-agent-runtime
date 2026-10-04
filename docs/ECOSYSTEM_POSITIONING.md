@@ -41,7 +41,7 @@ at-least-once plus idempotency giving "effectively once".
 *Overlap:* durable state, retries, crash recovery, fencing of attempts.
 
 *What SAR adds:*
-* the inverse default for consequential actions: *at most one dispatch per approval*,
+* the inverse default for consequential actions: *at most one dispatch per approved attempt*,
   never a blind retry of an uncertain outcome, and an explicit `effect_unknown` that only
   reconciliation or a human can leave;
 * authority coupled to the action: policy, digest-bound approval, re-check at dispatch;

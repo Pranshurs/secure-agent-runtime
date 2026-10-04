@@ -24,20 +24,20 @@ deployment model described in the last section.
 | 3 | malformed, oversized or hostile arguments | MITIGATED | strict JSON-mode validation, extra fields forbidden, 64 KiB cap, surrogates, huge ints and deep nesting refused (`test_hostile_inputs.py`, `test_fuzz.py`) |
 | 4 | tool description or annotation claims "read-only" | MITIGATED | only the operator-registered `Effect` counts (`test_tool_description_cannot_lower_the_bar`) |
 | 5 | **identity confusion**: a bare string or session id accepted as an approver | MITIGATED | approvals need a credential checked by the host's `Authenticator`; the authenticated subject is the approver (`test_auth_and_signing.py`) |
-| 6 | self-approval, or an unknown or unprivileged approver | MITIGATED | directory lookup; requester ≠ approver; also re-checked at dispatch |
+| 6 | self-approval, or an unknown or unprivileged approver | MITIGATED | directory lookup; requester ≠ approver; also re-checked at dispatch. The requester is the `principal_id` the host passes to `propose`: SAR trusts that label, and only approvers are authenticated |
 | 7 | **replay of an approval credential** | MITIGATED | each credential is consumed in the same transaction as the approval (`test_credential_replay_is_refused`) |
-| 8 | approval of A used to run B (args, tool version, schema, frame, deadline) | MITIGATED | approval binds the action digest, re-derived from the current tool definition just before dispatch; credentials can be scoped to one digest |
+| 8 | approval of A used to run B (args, tool version, schema, frame, deadline) | MITIGATED | approval binds the action digest, re-derived from the current tool definition just before dispatch; credentials can be scoped to one digest. The schema digest covers the pydantic JSON schema only: a tool's code, custom validators, observer root, timeout and reconciler are not in it, so bump the tool's `version` when they change |
 | 9 | stale approval dispatched long after it was given | MITIGATED | human approvals expire after `approval_ttl_s` if not dispatched |
 | 10 | **duplicate effect** from duplicate or concurrent requests | MITIGATED | idempotency key is the primary key; the dispatch claim is a compare-and-set fenced on the dispatch count (`test_concurrent_duplicate_dispatch_moves_money_once`, stress harness) |
 | 11 | **response loss** after the effect, then a retry | MITIGATED with a reconciler, otherwise PARTIAL | `effect_unknown` is never re-dispatched until a reconciler (or an authenticated human) says the effect did not happen |
 | 12 | **stale worker or stale reconciler** decides a later attempt | MITIGATED | outcome and reconciliation transitions are fenced by attempt; reconcile and resolve wait while the previous worker is alive (`test_stale_reconciliation_cannot_reopen_a_later_attempt`) |
-| 13 | timed-out tool keeps acting | MITIGATED for `isolation="process"` (the worker is killed); PARTIAL for thread isolation (the thread can't be killed, so SAR waits for it before reconciling) | `test_timed_out_worker_is_killed_and_cannot_act_later` |
+| 13 | timed-out tool keeps acting | MITIGATED for `isolation="process"`: the worker leads its own process group, which is killed on timeout, when the worker dies and as soon as its reply arrives, so child processes and leftover threads go too. Work handed outside the group (a daemon, another host) is not stopped. PARTIAL for thread isolation: the thread can't be killed, so SAR waits for it before reconciling | `test_timed_out_worker_is_killed_and_cannot_act_later`, `test_nothing_the_worker_left_running_acts_after_the_attempt_is_decided` |
 | 14 | runtime crash at any execution boundary | MITIGATED | real SIGKILL at claim, spawn, effect, commit and reconciliation boundaries; recovery leaves `effect_unknown`, never a blind re-run (`test_process_crashes.py`) |
 | 15 | **orphaned worker** acts after its runtime died | MITIGATED on Linux (`PR_SET_PDEATHSIG`); PARTIAL on macOS (no equivalent, so an orphan can outlive the runtime) | `test_runtime_killed_while_the_effect_is_executing` |
 | 16 | **audit tampering**: editing, deleting or reordering events | MITIGATED | SHA-256 hash chain; truncation of the newest events is caught only against an external anchor (`head()`) |
-| 17 | tampering with stored rows: state, arguments, approval | MITIGATED for single edits | stored action re-hashed at dispatch; approval and state must match audit events (`test_review_regressions.py` A4) |
+| 17 | tampering with stored rows: state, arguments, approval, result, frame verdict, snapshot, dispatch count, principal | MITIGATED for single edits | stored action re-hashed at dispatch; the row's principal, tool, run and key must equal the signed action's; state, approval and every field a receipt reports must match the audit events that set them (`test_review_regressions.py` A4, `test_one_edit_to_any_reported_row_field_fails_against_the_store`, `test_editing_the_rows_principal_cannot_dodge_a_revoked_grant`) |
 | 18 | **receipt forgery** | MITIGATED with Ed25519 for anyone without the private key. PARTIAL with HMAC: any key holder can forge. | signatures cover algorithm, key id and the full receipt digest; verification can require the expected action (`test_auth_and_signing.py`) |
-| 19 | **frame-observer blind spot**: a change the observer doesn't see | PARTIAL | frames detect only what the observer snapshots, at two instants. Changes outside the root, or made and reverted between the snapshots, are invisible. Detection, not prevention. |
+| 19 | **frame-observer blind spot**: a change the observer doesn't see | PARTIAL | frames detect only what the observer snapshots, at two instants. Changes outside the root, or made and reverted between the snapshots, are invisible. A missing or unreadable root fails the snapshot rather than looking empty. Detection, not prevention. |
 | 20 | **malicious tool or provider**: lies in its result or reconciler | OUT OF SCOPE | SAR validates the shape, not the truth. A reconciler that lies can cause a second dispatch (shown by the property test's planted "lying reconciler") |
 | 21 | **unexpected code execution** inside a tool | OUT OF SCOPE | tools run with SAR's privileges; use a sandbox (container, seccomp, VM) |
 | 22 | **denial of service** | PARTIAL | argument size caps, per-turn call cap, hung-thread cap (`max_stuck_workers`), timeouts. Process mode costs one process per dispatch. No rate limiting. |
@@ -45,8 +45,8 @@ deployment model described in the last section.
 | 24 | **database compromise**: full write access | OUT OF SCOPE | a consistent rebuild of rows, chain and HMAC receipts is undetectable without an external anchor; Ed25519 receipts held elsewhere still prove what was signed |
 | 25 | **compromised host**: kernel, Python, dependencies | OUT OF SCOPE | |
 | 26 | **supply-chain compromise** of SAR or its dependencies | PARTIAL | one runtime dependency (pydantic) plus optional extras; CI runs pip-audit, bandit and secret scanning, builds an SBOM, and pins actions by SHA. No signed releases yet. |
-| 27 | **privacy**: secrets in logs, receipts or telemetry | MITIGATED for SAR's own outputs | validator messages and exception text aren't echoed; receipts carry salted digests; telemetry has no argument values or keys. The store does hold arguments and results in plaintext (files are 0600). |
-| 28 | two runtimes, or two processes, on one database | MITIGATED | exclusive `flock` per file and one Runtime per Store; a second owner gets `StoreLocked` |
+| 27 | **privacy**: secrets in logs, receipts or telemetry | MITIGATED for SAR's own outputs | validator messages and exception text aren't echoed; the argument digest in receipts is salted per action, but the result digest and observed-state digests are not, so a low-entropy result (a balance) can be guessed from its receipt; telemetry has no argument values or keys. The store does hold arguments and results in plaintext (files are 0600). |
+| 28 | two runtimes, or two processes, on one database | MITIGATED on one local file system | exclusive `flock` on a lock file named from the resolved path, and one Runtime per Store; a second owner, including through a symlink, gets `StoreLocked`. Hard links, bind mounts and network file systems are not detected (`test_a_symlink_to_an_owned_database_cannot_open_a_second_store`) |
 
 ## Mapping to the OWASP Top 10 for Agentic Applications (2026)
 
@@ -68,10 +68,14 @@ The mapping is SAR's own reading of the OWASP categories. It is not an OWASP ass
 ## Deployment model the guarantees assume
 
 * **One owner per database.** A file-backed store is locked to one Store object in one
-  process (enforced). "At most one dispatch per approval" is established for that
-  model only. SAR makes no distributed or multi-node claim and is **not exactly-once**.
+  process (enforced). "At most one dispatch per approved attempt" is established for
+  that model only. SAR makes no distributed or multi-node claim and is **not exactly-once**.
 * The host authenticates approvers (through the `Authenticator` it supplies). SAR
-  trusts the `AuthContext` it gets back.
+  trusts the `AuthContext` it gets back. `propose`, `cancel`, `execute` and `reconcile`
+  are host API calls with no authentication of their own: whoever can call them is the
+  host. Only `approve`, `reject` and `resolve` need a credential.
+* Frame globs are operator code. Don't build them from raw arguments: `*`, `?` and `**`
+  in an argument would be interpreted as wildcards.
 * Tools are registered with the right `Effect`. A WRITE tool registered as READ is
   governed as READ.
 * Consequential tools use `isolation="process"`, and run on Linux for the

@@ -81,9 +81,14 @@ These are what the tests, the property-based state machine and the mutants check
    re-derives the action digest from the stored action and the *current* tool
    definition (version, schema, declared frame). It compares that with the stored
    digest, the approval record and the approval's audit event.
-2. **At most one dispatch per approval.** The claim `approved → executing` is a
+2. **At most one dispatch per approved attempt.** The claim `approved → executing` is a
    compare-and-set on state *and* dispatch count, and increments the count. A second or
-   stale executor's claim fails.
+   stale executor's claim fails. An action that was dispatched can be dispatched again
+   only through invariant 3, that is, after the previous attempt is known to have had no
+   effect. The original approval then still authorises it, but only within
+   `approval_ttl_s` of when it was given; a later retry is cancelled and needs a new
+   proposal. A reconciler that keeps saying "not applied" therefore gets one dispatch per
+   verdict, which is why a lying reconciler is out of scope (threat model #20).
 3. **`effect_unknown` is never re-dispatched directly.** The only ways back to
    `approved` are a reconciler returning `NotApplied`, or an authenticated approver's
    `resolve(applied=False, redispatch=True)`.
@@ -97,18 +102,24 @@ These are what the tests, the property-based state machine and the mutants check
    outcome; a different request raises `ReplayDivergence`.
 7. **Every state change has exactly one audit event, in the same transaction.** A
    proposal writes two: `call.requested`, then its initial state.
-8. **The row is backed by the log.** The latest state event names the row's state, and
-   the latest `call.approved` event carries the digest of the row's approval.
+8. **The row is backed by the log.** The latest state event names the row's state; the
+   latest `call.approved` event carries the digest of the row's approval; and every
+   transition's event records a digest of each field it set (result, result digest,
+   frame result, pre-dispatch snapshot, dispatch count, reason). `execute` also requires
+   the row's principal, tool, run and key to equal those in the signed action.
 9. **`call.executing` events ≥ real dispatches.** They are equal unless a crash or a
    cooperative cancel happened between the claim and the call.
 
 ## Deployment model, and what is *not* claimed
 
 * **One owner per database file**, enforced. A second Store on the same file, in any
-  process, gets `StoreLocked`; a second Runtime on the same Store is refused. The
-  at-most-once guarantee is established for this model only.
-* **Not exactly-once, not distributed.** SAR gives at most one dispatch per approval and
-  never re-dispatches an unknown outcome blindly. Exactly one *effect* additionally needs
+  process, gets `StoreLocked`; a second Runtime on the same Store is refused. The lock is
+  taken on the resolved path, so a symlink can't take a second one. Hard links, bind
+  mounts and network file systems are not detected and not supported. The at-most-once
+  guarantee is established for this model only.
+* **Not exactly-once, not distributed.** SAR gives at most one dispatch per approved
+  attempt, starts another attempt only after the previous one is known to have had no
+  effect, and never re-dispatches an unknown outcome blindly. Exactly one *effect* additionally needs
   a truthful reconciler, or a human, and a provider that honours idempotency keys where
   possible (`ctx.idempotency_key` is passed to every tool).
 * **No multi-node operation.** Running SAR on several nodes against one database is

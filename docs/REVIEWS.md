@@ -71,6 +71,41 @@ known vulnerabilities, `bandit` raises no real issues, and the README counts rep
 | P0 | The first version of the property test never reached a dispatch, so it couldn't fail | test gap | planted a reconciler that always says "not applied"; the test still passed | rules re-weighted; the planted bug is now found with a 3-step counterexample | `test_state_machine_properties.py` |
 | M1 | Mutant C15 (catch only `TypeError`/`ValueError` for hostile JSON) survived on Python 3.12, whose JSON encoder accepts 5000 levels of nesting | test gap | CI mutation job | test nesting raised to 100k levels | `test_hostile_inputs.py` |
 
-## Final cold review
+## Round 4: final cold review against the Level-A contract
 
-See the end of this file (added after the last review).
+One reviewer (an AI subagent, Sonnet), told nothing about earlier findings, attacked each
+stage of *proposal → canonicalization → authority → exact-argument approval → durable
+execution → consequential effect → safe retry / reconciliation → frame verification →
+Agent Receipt* through the public API and reproduced each finding with a script. Every
+reproduction was re-run before fixing. Each fix has a test that fails on the pre-fix code
+and passes after.
+
+| id | finding | severity | fix | regression test |
+|---|---|---|---|---|
+| F1 | A refused or raced approval burned its one-time credential (consumed before the compare-and-set, committed on failure) | MED | consume only after the state change succeeds | `test_an_approval_that_loses_a_race_does_not_burn_the_credential` |
+| F2 | A symlink to an owned database took a second lock: two runtimes, a double dispatch | MED | lock the resolved path | `test_a_symlink_to_an_owned_database_cannot_open_a_second_store` |
+| F3 | "At most one dispatch per approval" overstated: each reconciler "not applied" re-arms the same approval | MED (docs) | wording: one dispatch per approved attempt, a new attempt only after "not applied", within the approval's TTL | – |
+| F4 | An exception between claim and result (worker can't start; malformed custom snapshot) left the action stuck in `executing` | MED | `failed` when the tool provably didn't run; `unverifiable` frame; malformed pre-dispatch snapshot blocks | `test_a_worker_*_that_cannot_start_*`, `test_a_malformed_snapshot_*` |
+| F5 | A missing or unreadable observer root looked empty, so deleting a forbidden directory read as "verified" | MED | snapshot fails instead | `test_a_mistyped_observer_root_*`, `test_an_observed_root_that_disappears_*`, `test_an_unreadable_directory_*` |
+| F6 | One edit to the row's result or frame verdict flipped a receipt, and `verify_receipt(store=)` accepted it | MED | each transition records digests of the fields it set; the store check requires them | `test_one_edit_to_any_reported_row_field_fails_against_the_store` (6 fields) |
+| F7 | The dispatch-time policy re-check used an unbound `principal` column | LOW-MED | row principal, tool, run and key must equal the signed action's | `test_editing_the_rows_principal_cannot_dodge_a_revoked_grant` |
+| F8 | Process mode killed only the worker: a child process or leftover thread could act after the attempt was decided | LOW-MED | worker leads a process group, killed on timeout, death and after the reply | `test_nothing_the_worker_left_running_acts_after_the_attempt_is_decided` |
+| F9 | Any later event (a replay, a refused approval) made receipts "stale" | LOW | only a later state change does | `test_events_that_change_nothing_do_not_make_a_receipt_stale` |
+| F10 | Signatures malleable (hex case, whitespace, extra fields); a self-consistent stub passed digest-only | LOW | canonical form only; required fields | `test_a_signature_verifies_only_in_its_one_canonical_form`, `test_verify_receipt_cli_rejects_a_self_consistent_stub` |
+| F11 | CLI exit codes: unusable key reported as a failed receipt; a traceback on missing fields | LOW | exit 2 for unusable keys; no traceback | `test_verify_receipt_cli_refuses_unusable_keys_as_could_not_check` |
+| F12 | Caller-supplied `action_digest` and reasons went unvalidated into the audit log (non-SAR exceptions; 5 MB events) | LOW | digest form checked first; reasons bounded UTF-8 | `test_a_hostile_action_digest_*`, `test_caller_supplied_reasons_are_bounded_text` |
+| F13 | After "not applied", an approval older than its TTL cancels the retry | LOW (docs) | documented (TRANSACTION_SEMANTICS invariant 2) | – |
+| F14 | "Salted digests" claim covered only the argument digest | LOW (docs) | result and observed-state digests documented as unsalted | – |
+| F15 | A declared frame skipped at resolve/reconcile (tool redeployed without its observer) read as "completed" | LOW | `unverifiable` | `test_a_declared_frame_that_can_no_longer_be_observed_*` |
+| F16 | A closed Runtime kept working; `approval_ttl_s=nan` meant approvals never expired; a huge deadline raised `OverflowError` | LOW | closed runtimes refuse; validation | `test_a_closed_runtime_refuses_every_operation`, `test_approval_ttl_*`, `test_a_deadline_too_large_*` |
+| F17 | Notes: the schema digest doesn't cover tool code or validators; the requester label is trusted; frame globs from arguments are injectable; host API calls are unauthenticated | INFO | documented (THREAT_MODEL #6, #8, deployment model) | – |
+
+Not changed, deliberately: a `Store` dropped without `close()` keeps its lock fd until the
+process exits (F16b). Adding a finalizer would hide an ownership bug; the rule is "close
+what you open", enforced in the tests by a fixture that fails any test leaving a store
+open.
+
+The reviewer also reported as sound, after checking: concurrent dispatch (60 trials, 6
+executors plus cancellers, at most one invocation), idempotency handling, canonicalization,
+authority, approval refusals, attempt fencing, the glob engine, file modes, receipts
+against the JSON Schema, and Ed25519/HMAC algorithm and key-id binding.

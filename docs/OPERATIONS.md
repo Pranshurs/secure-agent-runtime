@@ -9,9 +9,19 @@
 * **Platforms.** Linux is the primary target and the only one where a killed runtime
   also kills its worker processes (`PR_SET_PDEATHSIG`). macOS works, and CI runs the
   test suite there, but an orphaned worker can outlive a killed runtime; reconcile again
-  after a crash. **Windows is not supported** for file-backed stores (no `fcntl`).
+  after a crash. Keep the database on a local file system, and open it by one path:
+  the lock follows symlinks, but hard links, bind mounts and network file systems
+  are not detected. **Windows is not supported** for file-backed stores (no `fcntl`).
 * **Python 3.10–3.13.** The only runtime dependency is pydantic. Ed25519 receipts need the
   `signing` extra (`cryptography`); telemetry needs the `otel` extra.
+
+## Lifecycle
+
+`with Store(path) as store:` and `with Runtime(...) as rt:` close what they opened. A
+`Runtime` closes its store only if it created it (`owns_store=True`, as the example
+factories do); a store you pass in stays yours. A closed `Runtime` refuses every
+operation. A `Store` dropped without `close()` keeps its file lock until the process
+exits.
 
 ## Start-up and recovery
 
@@ -24,7 +34,7 @@ by reconciling:
 for key in rt.recovered:
     o = rt.reconcile(key)              # asks the tool's reconciler
     if o.state == "approved":          # it said "not applied"
-        rt.execute(key)                # one more dispatch, re-checked
+        rt.execute(key)                # another dispatch, re-checked (within the approval's TTL)
     elif o.state == "effect_unknown":  # no reconciler, or it couldn't decide
         ...                            # a person decides: rt.resolve(key, credential=..., applied=...)
 ```

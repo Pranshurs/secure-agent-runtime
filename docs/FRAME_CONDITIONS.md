@@ -56,7 +56,8 @@ and matches every character `*` can, including newlines. Everything else is lite
 * `FileTreeObserver(root, ignore=...)` records regular files (content and permission
   bits), directories (so an empty new directory shows), and symlinks by target text,
   never followed. It does not see ownership, timestamps or extended attributes. A name
-  that isn't valid UTF-8 makes the snapshot fail. Before dispatch that blocks the call;
+  that isn't valid UTF-8, a root that doesn't exist (a typo, an unmounted volume) or a
+  directory it can't read makes the snapshot fail, rather than look empty. Before dispatch that blocks the call;
   after dispatch it makes the verdict `unverifiable`. It is never reported as
   verified.
 * `MappingObserver(source)` takes any `{str id: JSON value}`: a ledger, a table, a
@@ -87,4 +88,6 @@ SLOPPY AGENT
   the result. Pair it with a sandbox or a scratch copy if you need to discard bad
   changes.
 * Concurrent writers to the observed state, including other agents, show up as
-  undeclared changes.
+  undeclared changes (or as unmet requirements, when they match a requirement's glob).
+* Globs are operator text. Don't build them from raw arguments: wildcards in an argument
+  would be interpreted.
