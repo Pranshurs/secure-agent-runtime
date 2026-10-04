@@ -193,7 +193,7 @@ def test_tool_receives_exactly_the_approved_arguments(store):
     o = rt.propose(run_id="r", principal_id="p", call_id="c", tool="t", arguments={"v": "HeLLo"})
     row = store.get_call(o.key)
     assert row.args == {"v": "hello"}
-    rt.approve(o.key, approver_id=APPROVER, args_hash=o.args_hash)
+    rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest)
     assert rt.execute(o.key).state == "succeeded" and seen == [row.args]
 
 
@@ -205,7 +205,7 @@ def test_schema_default_added_after_approval_blocks_execution(rt, app):
 
     o = rt.propose(run_id="r", principal_id=AGENT, call_id="c", tool="write_note",
                    arguments={"title": "todo", "body": "b"})
-    rt.approve(o.key, approver_id=APPROVER, args_hash=o.args_hash)
+    rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest)
 
     class WriteV2(BaseModel):
         model_config = ConfigDict(extra="forbid")
@@ -235,7 +235,7 @@ def test_late_result_after_store_close_does_not_raise_in_worker(clock, caplog):
             return {"v": None}
 
         rt = _single_tool_runtime(store, slow, timeout_s=0.05)
-        assert _run(rt).state == "timed_out"
+        assert _run(rt).state == "failed"
         store.close()
         release.set()
         assert done.wait(5)
@@ -267,9 +267,9 @@ def test_failed_commit_rolls_back_and_store_stays_usable(rt, app):
 
     rt.store._db = FailingCommit()
     with pytest.raises(sqlite3.OperationalError):
-        rt.approve(o.key, approver_id=APPROVER, args_hash=o.args_hash)
-    assert rt.store.get_call(o.key).state == "pending_approval"  # rolled back
-    assert rt.approve(o.key, approver_id=APPROVER, args_hash=o.args_hash).state == "approved"
+        rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest)
+    assert rt.store.get_call(o.key).state == "awaiting_approval"  # rolled back
+    assert rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest).state == "approved"
     assert rt.store.verify_audit()[0]
     assert rt.execute(o.key).state == "succeeded" and execution_events(rt.store) == 1
 

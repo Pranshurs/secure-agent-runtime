@@ -160,8 +160,8 @@ def _demo() -> None:  # pragma: no cover - illustrative
     for key in res.pending:
         row = rt.store.get_call(key)
         assert row is not None
-        print(f"alice approves {row.tool} {row.args} (args_hash {row.args_hash[:12]}...)")
-        rt.approve(key, approver_id=APPROVER, args_hash=row.args_hash)
+        print(f"alice approves {row.tool} {row.args} (action {row.action_digest[:19]}...)")
+        rt.approve(key, approver_id=APPROVER, action_digest=row.action_digest)
     res = agent.resume("run-1")
     for o in res.outcomes:
         print(f"{o.tool:12} {o.state:18} {o.reason}")

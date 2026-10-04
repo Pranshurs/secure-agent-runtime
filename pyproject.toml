@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "secure-agent-runtime"
-version = "0.1.0"
-description = "A tool-call governor for LLM agents: the model proposes, the runtime disposes."
+version = "0.2.0.dev0"
+description = "Transactional execution and verifiable side-effect receipts for AI agents."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
@@ -18,8 +18,11 @@ classifiers = [
     "Topic :: Security",
 ]
 
+[project.scripts]
+secure-agent-runtime = "secure_agent_runtime.__main__:main"
+
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.6"]
+dev = ["pytest>=8", "ruff>=0.6", "jsonschema>=4.18"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/secure_agent_runtime"]
@@ -30,7 +33,7 @@ addopts = "-q --strict-markers"
 filterwarnings = ["error"]
 
 [tool.ruff]
-line-length = 110
+line-length = 120
 target-version = "py310"
 src = ["src", "tests", "scripts"]
 

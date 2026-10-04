@@ -34,31 +34,39 @@ from .contracts import canonical_json
 
 GENESIS = "0" * 64
 
-INITIAL_STATES = frozenset({"invalid", "denied", "pending_approval", "approved"})
+INITIAL_STATES = frozenset({"invalid", "denied", "awaiting_approval", "approved"})
 TRANSITIONS: dict[str, frozenset[str]] = {
-    "pending_approval": frozenset({"approved", "rejected", "expired", "cancelled"}),
+    "awaiting_approval": frozenset({"approved", "rejected", "expired", "cancelled"}),
     "approved": frozenset({"executing", "cancelled"}),
-    "executing": frozenset({"succeeded", "failed", "timed_out", "output_rejected", "outcome_unknown"}),
+    "executing": frozenset({"succeeded", "failed", "effect_unknown", "output_rejected"}),
+    # Only reconciliation leaves effect_unknown: applied -> succeeded, not applied ->
+    # approved (may be dispatched again) or failed (not dispatched again).
+    "effect_unknown": frozenset({"succeeded", "approved", "failed"}),
 }
 TERMINAL_STATES = frozenset({"invalid", "denied", "rejected", "expired", "cancelled", "succeeded",
-                             "failed", "timed_out", "output_rejected", "outcome_unknown"})
-_UPDATABLE = frozenset({"reason", "result", "approved_by", "approved_hash"})
+                             "failed", "output_rejected"})
+_JSON_FIELDS = frozenset({"result", "approval", "before", "frame_result"})
+_UPDATABLE = _JSON_FIELDS | {"reason", "result_digest", "dispatches"}
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS calls (
-    key            TEXT PRIMARY KEY,         -- run_id ':' call_id
+    key            TEXT PRIMARY KEY,         -- the idempotency key
     run_id         TEXT NOT NULL,
     call_id        TEXT NOT NULL,
     principal      TEXT NOT NULL,
     tool           TEXT NOT NULL,
-    args_json      TEXT NOT NULL,
-    args_hash      TEXT NOT NULL,            -- over validated args; approvals bind to it
+    args_json      TEXT NOT NULL,            -- validated args, or the raw proposal if invalid
+    action_json    TEXT,                     -- canonical Action body; NULL if invalid
+    action_digest  TEXT,                     -- approvals and receipts bind to this
     request_hash   TEXT NOT NULL,            -- over the raw proposal; replay detection only
     state          TEXT NOT NULL,
     reason         TEXT NOT NULL DEFAULT '',
     result_json    TEXT,
-    approved_by    TEXT,
-    approved_hash  TEXT,
+    result_digest  TEXT,
+    approval_json  TEXT,
+    dispatches     INTEGER NOT NULL DEFAULT 0,
+    before_json    TEXT,                     -- effect snapshot digests taken before dispatch
+    frame_result_json TEXT,
     expires_at     REAL,
     created_at     REAL NOT NULL,
     updated_at     REAL NOT NULL
@@ -90,14 +98,20 @@ class CallRow:
     principal: str
     tool: str
     args: Any
-    args_hash: str
+    action: dict[str, Any] | None
+    action_digest: str | None
     request_hash: str
     state: str
     reason: str
     result: dict[str, Any] | None
-    approved_by: str | None
-    approved_hash: str | None
+    result_digest: str | None
+    approval: dict[str, Any] | None
+    dispatches: int
+    before: dict[str, str] | None
+    frame_result: dict[str, Any] | None
     expires_at: float | None
+    created_at: float
+    updated_at: float
 
 
 @dataclass(frozen=True)
@@ -207,21 +221,22 @@ class Store:
 
     # -- calls ------------------------------------------------------------------ #
     def insert_call(self, *, key: str, run_id: str, call_id: str, principal: str, tool: str,
-                    args: Any, args_hash: str, request_hash: str, state: str, reason: str,
-                    expires_at: float | None, event: dict[str, Any],
-                    approved_by: str | None = None, approved_hash: str | None = None) -> bool:
+                    args: Any, action: dict[str, Any] | None, action_digest: str | None,
+                    request_hash: str, state: str, reason: str, expires_at: float | None,
+                    created_at: float, event: dict[str, Any], approval: dict[str, Any] | None = None) -> bool:
         """Insert a new call with its first events. False if the key already exists."""
         if state not in INITIAL_STATES:
             raise IllegalTransition(f"a call cannot start in {state!r}")
-        now = self.now()
         with self.tx() as db:
             try:
                 db.execute(
-                    "INSERT INTO calls (key, run_id, call_id, principal, tool, args_json, args_hash,"
-                    " request_hash, state, reason, approved_by, approved_hash, expires_at, created_at,"
+                    "INSERT INTO calls (key, run_id, call_id, principal, tool, args_json, action_json,"
+                    " action_digest, request_hash, state, reason, approval_json, expires_at, created_at,"
                     " updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (key, run_id, call_id, principal, tool, canonical_json(args), args_hash,
-                     request_hash, state, reason, approved_by, approved_hash, expires_at, now, now))
+                    (key, run_id, call_id, principal, tool, canonical_json(args),
+                     None if action is None else canonical_json(action), action_digest, request_hash,
+                     state, reason, None if approval is None else canonical_json(approval), expires_at,
+                     created_at, created_at))
             except sqlite3.IntegrityError:
                 return False
             self._append(db, run_id, key, "call.requested", event)
@@ -242,8 +257,12 @@ class Store:
         cols = ["state=?", "updated_at=?"]
         values: list[Any] = [to_state, self.now()]
         for k, v in fields.items():
-            cols.append("result_json=?" if k == "result" else f"{k}=?")
-            values.append(canonical_json(v) if k == "result" else v)
+            if k in _JSON_FIELDS:
+                cols.append(f"{k}_json=?")
+                values.append(None if v is None else canonical_json(v))
+            else:
+                cols.append(f"{k}=?")
+                values.append(v)
         with self.tx() as db:
             cur = db.execute(f"UPDATE calls SET {', '.join(cols)} WHERE key=? AND state=?",
                              (*values, key, from_state))
@@ -268,11 +287,16 @@ class Store:
             return [_row(r) for r in self._db.execute(q + " ORDER BY created_at, key", p).fetchall()]
 
 
+def _j(text: str | None) -> Any:
+    return None if text is None else json.loads(text)
+
+
 def _row(r: sqlite3.Row) -> CallRow:
     return CallRow(
         key=r["key"], run_id=r["run_id"], call_id=r["call_id"], principal=r["principal"], tool=r["tool"],
-        args=json.loads(r["args_json"]), args_hash=r["args_hash"], request_hash=r["request_hash"],
-        state=r["state"], reason=r["reason"],
-        result=json.loads(r["result_json"]) if r["result_json"] is not None else None,
-        approved_by=r["approved_by"], approved_hash=r["approved_hash"], expires_at=r["expires_at"],
+        args=json.loads(r["args_json"]), action=_j(r["action_json"]), action_digest=r["action_digest"],
+        request_hash=r["request_hash"], state=r["state"], reason=r["reason"], result=_j(r["result_json"]),
+        result_digest=r["result_digest"], approval=_j(r["approval_json"]), dispatches=r["dispatches"],
+        before=_j(r["before_json"]), frame_result=_j(r["frame_result_json"]), expires_at=r["expires_at"],
+        created_at=r["created_at"], updated_at=r["updated_at"],
     )

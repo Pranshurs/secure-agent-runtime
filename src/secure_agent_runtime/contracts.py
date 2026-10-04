@@ -18,6 +18,7 @@ Validation is deliberately strict:
 
 from __future__ import annotations
 
+import dataclasses
 import enum
 import hashlib
 import inspect
@@ -44,27 +45,79 @@ class ContractError(ValueError):
     """A tool spec is unsafe or inconsistent. Raised at registration, never at run time."""
 
 
+class EffectNotApplied(Exception):  # noqa: N818 - it is an outcome, not only an error
+    """Raised by a tool that knows for certain its side effect did not happen.
+
+    Any other exception from a WRITE or EXTERNAL tool leaves the effect unknown.
+    """
+
+
+@dataclass(frozen=True)
+class ToolContext:
+    """What a tool may learn about the action it is executing."""
+
+    action_id: str
+    idempotency_key: str
+    attempt: int
+    cancel: threading.Event
+
+
+@dataclass(frozen=True)
+class Applied:
+    """Reconciliation found that the effect happened; ``result`` is the tool's output."""
+
+    result: Any
+
+
+@dataclass(frozen=True)
+class NotApplied:
+    """Reconciliation established that the effect did not happen."""
+
+
+@dataclass(frozen=True)
+class Unknown:
+    """Reconciliation could not decide."""
+
+    reason: str = ""
+
+
+Reconciliation = Applied | NotApplied | Unknown
+
+
 def _forbids_extra(model: type[BaseModel]) -> bool:
     return model.model_config.get("extra") == "forbid"
 
 
 @dataclass(frozen=True)
 class ToolSpec:
+    """An operator-registered tool. Everything the runtime trusts about a tool lives here.
+
+    ``fn(args)`` or ``fn(args, ctx)`` performs the effect. ``reconciler(args, ctx)``, if
+    given, answers "did this action's effect happen?" after an uncertain execution.
+    ``observer`` snapshots the state the tool may change, and ``frame(args)`` declares
+    which changes are required, allowed and forbidden for one call (see ``effects``).
+    """
+
     name: str
     input_model: type[BaseModel]
     output_model: type[BaseModel]
     fn: Callable[..., Any]
     effect: Effect
+    version: str = "1"
     timeout_s: float = 10.0
     description: str = ""
-    # Receives a threading.Event that is set when the call times out.
-    accepts_cancel: bool = False
+    takes_ctx: bool = False
+    reconciler: Callable[[Any, ToolContext], Reconciliation] | None = None
+    observer: Any = None  # an effects.Observer
+    frame: Callable[[Any], Any] | None = None  # args model -> effects.FrameSpec
 
     def __post_init__(self) -> None:
         if not self.name or not self.name.replace("_", "").replace("-", "").isalnum():
             raise ContractError(f"invalid tool name {self.name!r}")
         if not isinstance(self.effect, Effect):
             raise ContractError(f"{self.name}: effect must be an Effect")
+        if not (isinstance(self.version, str) and self.version):
+            raise ContractError(f"{self.name}: version must be a non-empty string")
         for label, model in (("input", self.input_model), ("output", self.output_model)):
             if not (isinstance(model, type) and issubclass(model, BaseModel)):
                 raise ContractError(f"{self.name}: {label} model must be a pydantic BaseModel")
@@ -73,6 +126,16 @@ class ToolSpec:
         if not (isinstance(self.timeout_s, (int, float)) and math.isfinite(self.timeout_s)
                 and self.timeout_s > 0):
             raise ContractError(f"{self.name}: timeout_s must be a positive finite number")
+        if self.reconciler is not None and self.effect is Effect.READ:
+            raise ContractError(f"{self.name}: a READ tool has no effect to reconcile")
+        if (self.frame is None) != (self.observer is None):
+            raise ContractError(f"{self.name}: frame and observer must be given together")
+
+    @property
+    def schema_digest(self) -> str:
+        """Identity of the input and output contracts; part of every action's digest."""
+        return "sha256:" + _sha256(canonical_json({"input": self.input_model.model_json_schema(),
+                                                   "output": self.output_model.model_json_schema()}))
 
     def json_schema(self) -> dict[str, Any]:
         """The input schema in the shape most tool-calling APIs accept."""
@@ -91,17 +154,40 @@ class ToolRegistry:
         self._tools[spec.name] = spec
         return spec
 
+    def replace(self, spec: ToolSpec) -> ToolSpec:
+        """Swap in a new definition of a registered tool (a redeploy). Pending actions are
+        re-checked against it, and its version and schema are part of their digest."""
+        if spec.name not in self._tools:
+            raise ContractError(f"tool {spec.name!r} is not registered")
+        self._tools[spec.name] = spec
+        return spec
+
     def tool(self, *, name: str | None = None, input: type[BaseModel], output: type[BaseModel],
-             effect: Effect, timeout_s: float = 10.0) -> Callable[[Callable[..., Any]], ToolSpec]:
-        """Decorator form of :meth:`register`."""
+             effect: Effect, version: str = "1", timeout_s: float = 10.0, observer: Any = None,
+             frame: Callable[[Any], Any] | None = None) -> Callable[[Callable[..., Any]], ToolSpec]:
+        """Decorator form of :meth:`register`. The tool gets a ``ToolContext`` if its second
+        parameter is named ``ctx``."""
 
         def wrap(fn: Callable[..., Any]) -> ToolSpec:
             params = inspect.signature(fn).parameters
             return self.register(ToolSpec(
                 name=name or fn.__name__, input_model=input, output_model=output, fn=fn,
-                effect=effect, timeout_s=timeout_s, description=inspect.getdoc(fn) or "",
-                accepts_cancel="cancel" in params,
+                effect=effect, version=version, timeout_s=timeout_s,
+                description=inspect.getdoc(fn) or "", takes_ctx="ctx" in params,
+                observer=observer, frame=frame,
             ))
+
+        return wrap
+
+    def reconciler(self, name: str) -> Callable[[Callable[..., Reconciliation]], ToolSpec]:
+        """Attach a reconciler to a registered tool: ``fn(args, ctx) -> Applied | NotApplied | Unknown``."""
+
+        def wrap(fn: Callable[..., Reconciliation]) -> ToolSpec:
+            spec = self._tools.get(name)
+            if spec is None:
+                raise ContractError(f"tool {name!r} is not registered")
+            self._tools[name] = dataclasses.replace(spec, reconciler=fn)
+            return self._tools[name]
 
         return wrap
 
@@ -142,11 +228,6 @@ def plain_json(value: Any) -> str | None:
 
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def args_hash(tool: str, args: dict[str, Any]) -> str:
-    """Identity of a request's content. An approval is bound to exactly this hash."""
-    return _sha256(canonical_json({"tool": tool, "args": args}))
 
 
 def request_hash(tool: Any, raw_args: Any) -> str:
@@ -221,6 +302,6 @@ def _short(exc: ValidationError) -> str:
     return "; ".join(f"{_loc(e['loc'])}: {e['msg']}" for e in exc.errors(include_input=False))[:500]
 
 
-def invoke(spec: ToolSpec, model: BaseModel, cancel: threading.Event) -> Any:
+def invoke(spec: ToolSpec, model: BaseModel, ctx: ToolContext) -> Any:
     """Call the tool with the validated input model."""
-    return spec.fn(model, cancel=cancel) if spec.accepts_cancel else spec.fn(model)
+    return spec.fn(model, ctx) if spec.takes_ctx else spec.fn(model)

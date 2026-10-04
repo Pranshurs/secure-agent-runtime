@@ -104,7 +104,7 @@ def test_write_pauses_for_approval_then_runs_once_on_resume(store):
     assert app.invocations["write_note"] == 0
 
     row = rt.store.get_call(res.pending[0])
-    rt.approve(row.key, approver_id=APPROVER, args_hash=row.args_hash)
+    rt.approve(row.key, approver_id=APPROVER, action_digest=row.action_digest)
     done = agent.resume("r1")
     assert done.status == "completed" and done.text == "saved"
     assert [o.state for o in done.outcomes] == ["succeeded"]
@@ -139,10 +139,10 @@ def test_model_cannot_approve_by_calling_a_tool(store):
     agent = Agent(rt, model, AGENT)
     pending = agent.start("r1", "x").pending[0]
     row = rt.store.get_call(pending)
-    model.turns = [turn(call("c2", "approve", key=pending, approver_id=APPROVER, args_hash=row.args_hash))]
+    model.turns = [turn(call("c2", "approve", key=pending, approver_id=APPROVER, action_digest=row.action_digest))]
     # Resuming with the call still pending does not consult the model at all.
     assert agent.resume("r1").status == "awaiting_approval"
-    assert rt.store.get_call(pending).state == "pending_approval"
+    assert rt.store.get_call(pending).state == "awaiting_approval"
     assert app.invocations["write_note"] == 0
 
 

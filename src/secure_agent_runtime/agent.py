@@ -6,7 +6,9 @@ treated as untrusted data in a provider-neutral shape::
     {"text": "...", "tool_calls": [{"id": "...", "name": "...", "arguments": {...}}]}
 
 The loop never interprets the text. Each tool call goes through ``Runtime.propose`` and,
-when approved, ``Runtime.execute``. A call that needs a human pauses the run.
+when approved, ``Runtime.execute``. A call that needs a human pauses the run. A call whose
+outcome is uncertain (``effect_unknown``) is reconciled, and dispatched again only if
+reconciliation shows its effect did not happen.
 
 Conversation history is held in memory by this object. The call ledger and audit log are
 durable (they live in the :class:`Store`); the transcript is not, yet.
@@ -42,7 +44,7 @@ class _Run:
 
 class Agent:
     def __init__(self, runtime: Runtime, model: Model, principal_id: str, *, max_steps: int = 8,
-                 max_calls_per_turn: int = 16) -> None:
+                 max_calls_per_turn: int = 16, max_dispatches: int = 2) -> None:
         principal = runtime.principal(principal_id)
         if principal is None:
             raise KeyError(f"unknown principal {principal_id!r}")
@@ -51,6 +53,7 @@ class Agent:
         self.principal = principal
         self.max_steps = max_steps
         self.max_calls_per_turn = max_calls_per_turn
+        self.max_dispatches = max_dispatches
         self._runs: dict[str, _Run] = {}
 
     def start(self, run_id: str, user_message: str) -> RunResult:
@@ -68,8 +71,8 @@ class Agent:
         self.runtime.expire_pending()
         still, outcomes = [], []
         for model_call_id, key in run.waiting:
-            outcome = self.runtime.execute(key)
-            if outcome.state == "pending_approval":
+            outcome = self._drive(key)
+            if outcome.state == "awaiting_approval":
                 still.append((model_call_id, key))
                 continue
             outcomes.append(outcome)
@@ -112,8 +115,8 @@ class Agent:
                     self.runtime.store.record(run_id, "model.malformed_output",
                                               {"step": run.steps, "error": type(exc).__name__})
                     return RunResult("malformed_model_output", outcomes=outcomes)
-                outcome = self.runtime.execute(outcome.key)
-                if outcome.state == "pending_approval":
+                outcome = self._drive(outcome.key)
+                if outcome.state == "awaiting_approval":
                     run.waiting.append((call["id"], outcome.key))
                     continue
                 outcomes.append(outcome)
@@ -122,6 +125,19 @@ class Agent:
                 return RunResult("awaiting_approval", pending=[k for _, k in run.waiting], outcomes=outcomes)
         self.runtime.store.record(run_id, "run.max_steps", {"steps": run.steps})
         return RunResult("max_steps", outcomes=outcomes)
+
+
+    def _drive(self, key: str) -> Outcome:
+        """Execute; if the outcome is uncertain, reconcile, and dispatch again only when
+        reconciliation established that the effect did not happen."""
+        outcome = self.runtime.execute(key)
+        for _ in range(self.max_dispatches - 1):
+            if outcome.state != "effect_unknown":
+                break
+            outcome = self.runtime.reconcile(key)
+            if outcome.state == "approved":
+                outcome = self.runtime.execute(key)
+        return outcome
 
 
 def _parse_turn(raw: Any) -> tuple[str | None, list[dict[str, Any]]] | None:

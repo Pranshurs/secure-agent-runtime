@@ -8,7 +8,8 @@ import time
 
 import pytest
 
-from secure_agent_runtime.contracts import args_hash
+from secure_agent_runtime.action import sha256_text
+from secure_agent_runtime.contracts import canonical_json
 from secure_agent_runtime.examples.notes import AGENT, APPROVER, NotesApp, WriteOut, build_runtime
 from secure_agent_runtime.policy import Principal
 from secure_agent_runtime.runtime import ApprovalRefused, MalformedProposal, ReplayDivergence, Runtime
@@ -32,6 +33,29 @@ def wait_for(cond, timeout=5.0):
     return False
 
 
+def tamper(store, key, *, action=None, digest=None, approval=None, state=None):
+    """Edit a call row behind the runtime's back (an attacker with database access)."""
+    sets, vals = [], []
+    for col, v in (("action_json", action), ("action_digest", digest), ("approval_json", approval),
+                   ("state", state)):
+        if v is not None:
+            sets.append(f"{col}=?")
+            vals.append(canonical_json(v) if isinstance(v, dict) else v)
+    with store.tx() as db:
+        db.execute(f"UPDATE calls SET {', '.join(sets)} WHERE key=?", (*vals, key))
+
+
+def with_args(row, **args):
+    body = dict(row.action)
+    body["args"] = {**body["args"], **args}
+    body["args_digest"] = sha256_text(canonical_json(body["args"]))
+    return body
+
+
+def digest_of(body):
+    return sha256_text(canonical_json(body))
+
+
 def write(rt, call_id="w1", title="todo", body="buy eggs", **kw):
     return propose(rt, call_id, "write_note", {"title": title, "body": body}, **kw)
 
@@ -49,7 +73,7 @@ def test_ungranted_tool_is_denied_and_never_invoked(rt, app):
 def test_denied_call_cannot_be_approved_into_execution(rt, app):
     o = propose(rt, "d1", "delete_note", {"title": "todo"})
     with pytest.raises(ApprovalRefused):
-        rt.approve(o.key, approver_id=APPROVER, args_hash=o.args_hash)
+        rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest)
     assert rt.execute(o.key).state == "denied" and app.invocations["delete_note"] == 0
 
 
@@ -79,7 +103,7 @@ def test_policy_constraint_denial_never_invokes(store, app):
 def test_revoked_grant_blocks_already_approved_call(store, app):
     rt, _ = build_runtime(store, app)
     o = write(rt)
-    rt.approve(o.key, approver_id=APPROVER, args_hash=o.args_hash)
+    rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest)
     rt._principals[AGENT] = Principal(AGENT, grants=frozenset({"read_note"}))
     out = rt.execute(o.key)
     assert out.state == "cancelled" and "policy now denies" in out.reason
@@ -90,9 +114,9 @@ def test_revoked_grant_blocks_already_approved_call(store, app):
 
 def test_write_requires_approval_and_does_not_run_while_pending(rt, app):
     o = write(rt)
-    assert o.state == "pending_approval"
+    assert o.state == "awaiting_approval"
     for _ in range(3):
-        assert rt.execute(o.key).state == "pending_approval"
+        assert rt.execute(o.key).state == "awaiting_approval"
     assert app.invocations["write_note"] == 0 and app.notes["todo"] == "buy milk"
 
 
@@ -104,7 +128,7 @@ def test_rejected_and_expired_and_cancelled_calls_never_run(rt, app, clock):
     rt.cancel(can.key)
     clock.advance(601)
     with pytest.raises(ApprovalRefused, match="window"):
-        rt.approve(exp.key, approver_id=APPROVER, args_hash=exp.args_hash)
+        rt.approve(exp.key, approver_id=APPROVER, action_digest=exp.action_digest)
     assert [rt.execute(k.key).state for k in (rej, exp, can)] == ["rejected", "expired", "cancelled"]
     assert app.invocations["write_note"] == 0
 
@@ -113,14 +137,14 @@ def test_approval_window_boundary_is_exclusive(rt, clock):
     o = write(rt)
     clock.advance(600)
     with pytest.raises(ApprovalRefused, match="window"):
-        rt.approve(o.key, approver_id=APPROVER, args_hash=o.args_hash)
+        rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest)
     assert rt.store.get_call(o.key).state == "expired"
 
 
 def test_approval_just_inside_window_succeeds(rt, clock):
     o = write(rt)
     clock.advance(599.9)
-    assert rt.approve(o.key, approver_id=APPROVER, args_hash=o.args_hash).state == "approved"
+    assert rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest).state == "approved"
 
 
 def test_expire_pending_sweeps_only_elapsed(rt, clock):
@@ -129,18 +153,18 @@ def test_expire_pending_sweeps_only_elapsed(rt, clock):
     b = write(rt, "w2")
     clock.advance(301)
     assert rt.expire_pending() == [a.key]
-    assert rt.store.get_call(b.key).state == "pending_approval"
+    assert rt.store.get_call(b.key).state == "awaiting_approval"
 
 
 def test_state_machine_has_no_shortcut_to_execution(rt):
     o = write(rt)
     for target in ("executing", "succeeded"):
         with pytest.raises(IllegalTransition):
-            rt.store.transition(o.key, "pending_approval", target)
+            rt.store.transition(o.key, "awaiting_approval", target)
     with pytest.raises(IllegalTransition):
         rt.store.insert_call(key="k", run_id="r", call_id="c", principal=AGENT, tool="write_note",
-                             args={}, args_hash="h", request_hash="h", state="executing", reason="",
-                             expires_at=None, event={})
+                             args={}, action=None, action_digest=None, request_hash="h",
+                             state="executing", reason="", expires_at=None, created_at=0, event={})
 
 
 def test_row_marked_approved_without_approval_record_is_blocked(rt, app):
@@ -161,14 +185,14 @@ def test_policy_auto_approval_does_not_survive_policy_tightening(store, app):
 
 # -- 3. approval for args A cannot run args B --------------------------------------------- #
 
-def test_approval_is_bound_to_args_hash(rt, app):
+def test_approval_is_bound_to_the_action_digest(rt, app):
     a = write(rt, "wA", body="A")
     b = write(rt, "wB", body="B")
-    assert a.args_hash != b.args_hash
-    with pytest.raises(ApprovalRefused, match="different arguments"):
-        rt.approve(b.key, approver_id=APPROVER, args_hash=a.args_hash)
-    rt.approve(a.key, approver_id=APPROVER, args_hash=a.args_hash)
-    assert rt.execute(b.key).state == "pending_approval"
+    assert a.action_digest != b.action_digest
+    with pytest.raises(ApprovalRefused, match="different action"):
+        rt.approve(b.key, approver_id=APPROVER, action_digest=a.action_digest)
+    rt.approve(a.key, approver_id=APPROVER, action_digest=a.action_digest)
+    assert rt.execute(b.key).state == "awaiting_approval"
     assert rt.execute(a.key).state == "succeeded"
     assert app.notes["todo"] == "A" and app.invocations["write_note"] == 1
 
@@ -176,30 +200,26 @@ def test_approval_is_bound_to_args_hash(rt, app):
 def test_approver_must_present_the_exact_hash(rt):
     o = write(rt)
     with pytest.raises(ApprovalRefused):
-        rt.approve(o.key, approver_id=APPROVER, args_hash="")
+        rt.approve(o.key, approver_id=APPROVER, action_digest="")
     with pytest.raises(ApprovalRefused):
-        rt.approve(o.key, approver_id=APPROVER, args_hash=args_hash("write_note", {"title": "todo"}))
-    assert rt.store.get_call(o.key).state == "pending_approval"
+        rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest.upper())
+    assert rt.store.get_call(o.key).state == "awaiting_approval"
 
 
 def test_args_swapped_in_storage_after_approval_do_not_run(rt, app):
     o = write(rt, body="A")
-    rt.approve(o.key, approver_id=APPROVER, args_hash=o.args_hash)
-    with rt.store.tx() as db:
-        db.execute("UPDATE calls SET args_json=? WHERE key=?",
-                   ('{"body":"B","title":"todo"}', o.key))
+    rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest)
+    tamper(rt.store, o.key, action=with_args(rt.store.get_call(o.key), body="B"))
     out = rt.execute(o.key)
-    assert out.state == "cancelled" and "do not match their hash" in out.reason
+    assert out.state == "cancelled" and "does not match its digest" in out.reason
     assert app.invocations["write_note"] == 0 and app.notes["todo"] == "buy milk"
 
 
 def test_args_and_hash_swapped_together_still_do_not_run(rt, app):
     o = write(rt, body="A")
-    rt.approve(o.key, approver_id=APPROVER, args_hash=o.args_hash)
-    b = {"body": "B", "title": "todo"}
-    with rt.store.tx() as db:
-        db.execute("UPDATE calls SET args_json=?, args_hash=? WHERE key=?",
-                   ('{"body":"B","title":"todo"}', args_hash("write_note", b), o.key))
+    rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest)
+    forged = with_args(rt.store.get_call(o.key), body="B")
+    tamper(rt.store, o.key, action=forged, digest=digest_of(forged))
     out = rt.execute(o.key)
     assert out.state == "cancelled" and "approval does not match" in out.reason
     assert app.invocations["write_note"] == 0
@@ -207,10 +227,9 @@ def test_args_and_hash_swapped_together_still_do_not_run(rt, app):
 
 def test_approval_recorded_for_other_args_does_not_run(rt, app):
     o = write(rt, body="A")
-    other = args_hash("write_note", {"body": "B", "title": "todo"})
-    with rt.store.tx() as db:
-        db.execute("UPDATE calls SET state='approved', approved_by=?, approved_hash=? WHERE key=?",
-                   (APPROVER, other, o.key))
+    other = digest_of(with_args(rt.store.get_call(o.key), body="B"))
+    tamper(rt.store, o.key, state="approved",
+           approval={"approver": APPROVER, "action_digest": other, "approved_at": 0, "kind": "human"})
     out = rt.execute(o.key)
     assert out.state == "cancelled" and "approval does not match" in out.reason
     assert app.invocations["write_note"] == 0
@@ -220,7 +239,7 @@ def test_schema_tightened_after_approval_blocks_execution(rt, app):
     from pydantic import BaseModel, ConfigDict, Field
 
     o = write(rt, body="a long body")
-    rt.approve(o.key, approver_id=APPROVER, args_hash=o.args_hash)
+    rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest)
 
     class ShortWrite(BaseModel):
         model_config = ConfigDict(extra="forbid")
@@ -249,8 +268,8 @@ def test_execution_claim_is_compare_and_set(rt, app):
 def test_requester_cannot_approve_itself(rt, app):
     o = write(rt)
     with pytest.raises(ApprovalRefused, match="not an approver"):
-        rt.approve(o.key, approver_id=AGENT, args_hash=o.args_hash)
-    assert rt.store.get_call(o.key).state == "pending_approval"
+        rt.approve(o.key, approver_id=AGENT, action_digest=o.action_digest)
+    assert rt.store.get_call(o.key).state == "awaiting_approval"
     assert app.invocations["write_note"] == 0
 
 
@@ -263,18 +282,17 @@ def test_approver_principal_cannot_approve_its_own_request(store, app):
                  principals=[boss, Principal(APPROVER, can_approve=True)])
     o = write(rt, principal_id="boss")
     with pytest.raises(ApprovalRefused, match="self-approval"):
-        rt.approve(o.key, approver_id="boss", args_hash=o.args_hash)
+        rt.approve(o.key, approver_id="boss", action_digest=o.action_digest)
     with pytest.raises(ApprovalRefused, match="self-approval"):
         rt.reject(o.key, approver_id="boss")
-    rt.approve(o.key, approver_id=APPROVER, args_hash=o.args_hash)
+    rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest)
     assert rt.execute(o.key).state == "succeeded"
 
 
 def test_self_approval_written_into_storage_is_blocked(rt, app):
     o = write(rt)
-    with rt.store.tx() as db:
-        db.execute("UPDATE calls SET state='approved', approved_by=?, approved_hash=? WHERE key=?",
-                   (AGENT, o.args_hash, o.key))
+    tamper(rt.store, o.key, state="approved",
+           approval={"approver": AGENT, "action_digest": o.action_digest, "approved_at": 0, "kind": "human"})
     assert rt.execute(o.key).state == "cancelled" and app.invocations["write_note"] == 0
 
 
@@ -282,7 +300,7 @@ def test_unknown_or_unprivileged_approvers_refused(rt):
     o = write(rt)
     for who in ("mallory", "policy:allow", ""):
         with pytest.raises(ApprovalRefused):
-            rt.approve(o.key, approver_id=who, args_hash=o.args_hash)
+            rt.approve(o.key, approver_id=who, action_digest=o.action_digest)
     refusals = rt.store.events(kind="approval.refused")
     assert len(refusals) == 3
 
@@ -298,11 +316,11 @@ def test_reserved_principal_id_rejected(store, app):
 
 def test_double_approval_refused(rt):
     o = write(rt)
-    rt.approve(o.key, approver_id=APPROVER, args_hash=o.args_hash)
-    with pytest.raises(ApprovalRefused, match="not pending"):
-        rt.approve(o.key, approver_id=APPROVER, args_hash=o.args_hash)
+    rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest)
+    with pytest.raises(ApprovalRefused, match="not awaiting"):
+        rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest)
     refusal = rt.store.events(kind="approval.refused")[-1]
-    assert refusal.data["reason"] == "call is approved, not pending approval"
+    assert refusal.data["reason"] == "action is approved, not awaiting approval"
 
 
 # -- 5. replay does not re-execute ------------------------------------------------------------- #
@@ -319,7 +337,7 @@ def test_replayed_proposal_returns_stored_outcome(rt, app):
 
 def test_replayed_approved_write_runs_once(rt, app):
     o = write(rt)
-    rt.approve(o.key, approver_id=APPROVER, args_hash=o.args_hash)
+    rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest)
     for _ in range(3):
         rt.execute(write(rt).key)
     assert app.invocations["write_note"] == 1
@@ -360,7 +378,7 @@ def test_concurrent_identical_proposals_share_one_record(rt):
         t.start()
     for t in threads:
         t.join()
-    assert not errors and results == ["pending_approval"] * 8
+    assert not errors and results == ["awaiting_approval"] * 8
     assert len(rt.store.calls()) == 1 and len(rt.store.events(kind="call.requested")) == 1
 
 
@@ -391,7 +409,7 @@ def test_replay_after_restart_does_not_re_execute(tmp_path, clock):
     app = NotesApp()
     rt, _ = build_runtime(Store(db, now=clock), app)
     o = write(rt)
-    rt.approve(o.key, approver_id=APPROVER, args_hash=o.args_hash)
+    rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest)
     rt.execute(o.key)
     rt.store.close()
 
@@ -428,17 +446,17 @@ def test_timeout_ends_safe_and_late_result_is_discarded(store, app):
     app.read = slow
     o = propose(rt, "c1", "read_note", {"title": "todo"})
     out = rt.execute(o.key)
-    assert out.state == "timed_out" and out.result is None
+    assert out.state == "failed" and "no result within" in out.reason and out.result is None
     assert "result" not in out.for_model()
 
     release.set()
     assert finished.wait(5)
     assert wait_for(lambda: store.events(kind="call.late_result_discarded"))
     row = store.get_call(o.key)
-    assert row.state == "timed_out" and row.result is None
+    assert row.state == "failed" and row.result is None
     late = store.events(kind="call.late_result_discarded")
     assert len(late) == 1 and late[0].data == {"would_have_been": "succeeded"}
-    assert rt.execute(o.key).state == "timed_out" and app.invocations["read_note"] == 1
+    assert rt.execute(o.key).state == "failed" and app.invocations["read_note"] == 1
 
 
 def test_timed_out_tool_is_told_to_cancel(store, app):
@@ -454,32 +472,32 @@ def test_timed_out_tool_is_told_to_cancel(store, app):
     reg = ToolRegistry()
 
     @reg.tool(input=In, output=In, effect=Effect.READ, timeout_s=0.05)
-    def waits(args, cancel):
-        if cancel.wait(5):
+    def waits(args, ctx):
+        if ctx.cancel.wait(5):
             seen.set()
         return In()
 
     rt = Runtime(registry=reg, policy=Policy(), store=store,
                  principals=[Principal("p", grants=frozenset({"waits"}))])
     o = rt.propose(run_id="r", principal_id="p", call_id="c", tool="waits", arguments={})
-    assert rt.execute(o.key).state == "timed_out"
+    assert rt.execute(o.key).state == "failed"
     assert seen.wait(5)
     assert wait_for(lambda: store.events(kind="call.late_result_discarded"))
 
 
-def test_crash_during_execution_recovers_to_outcome_unknown(tmp_path, clock):
+def test_crash_during_execution_recovers_to_effect_unknown(tmp_path, clock):
     db = str(tmp_path / "sar.db")
     app = NotesApp()
     rt, _ = build_runtime(Store(db, now=clock), app)
     o = write(rt)
-    rt.approve(o.key, approver_id=APPROVER, args_hash=o.args_hash)
+    rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest)
     rt.store.transition(o.key, "approved", "executing")  # crash right after claiming the call
     rt.store.close()
 
     rt2, _ = build_runtime(Store(db, now=clock), app)
     assert rt2.recover() == [o.key]
-    assert rt2.execute(o.key).state == "outcome_unknown"
-    assert write(rt2).state == "outcome_unknown"
+    assert rt2.execute(o.key).state == "effect_unknown"
+    assert write(rt2).state == "effect_unknown"
     assert app.invocations["write_note"] == 0
     rt2.store.close()
 
@@ -490,15 +508,30 @@ def test_crash_during_execution_recovers_to_outcome_unknown(tmp_path, clock):
     None, "ok", {"title": "todo"}, {"title": "todo", "created": "yes"},
     {"title": "todo", "created": True, "leak": "secret"}, object(),
 ])
-def test_malformed_tool_output_is_rejected(rt, app, bad):
+def test_malformed_output_of_a_write_tool_leaves_the_effect_unknown(rt, app, bad):
+    """The write ran, but its result can't be trusted: neither 'succeeded' nor 'failed' is
+    honest, so the action is held for reconciliation and its output never reaches the model."""
     app.write = lambda args: bad
     o = write(rt)
-    rt.approve(o.key, approver_id=APPROVER, args_hash=o.args_hash)
+    rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest)
     out = rt.execute(o.key)
+    assert out.state == "effect_unknown" and out.result is None and "invalid output" in out.reason
+    assert out.for_model() == {"status": "effect_unknown", "error": "outcome uncertain; held for reconciliation"}
+    assert "secret" not in str([e.data for e in rt.store.events()])
+    assert app.invocations["write_note"] == 1
+    assert rt.execute(o.key).state == "effect_unknown" and app.invocations["write_note"] == 1
+
+
+@pytest.mark.parametrize("bad", [
+    None, {"title": "todo"}, {"title": "todo", "found": "yes", "body": None},
+    {"title": "todo", "found": True, "body": None, "leak": "secret"}, object(),
+])
+def test_malformed_output_of_a_read_tool_is_rejected(rt, app, bad):
+    app.read = lambda args: bad
+    out = rt.execute(propose(rt, "c1", "read_note", {"title": "todo"}).key)
     assert out.state == "output_rejected" and out.result is None
     assert out.for_model() == {"status": "output_rejected", "error": "tool output failed validation"}
     assert "secret" not in str([e.data for e in rt.store.events()])
-    assert app.invocations["write_note"] == 1
 
 
 def test_output_of_another_model_class_is_judged_by_its_content(rt, app):
@@ -525,7 +558,7 @@ def _busy_history(rt, app, store):
     rt.execute(propose(rt, "c2", "delete_note", {"title": "todo"}).key)      # denied
     rt.execute(propose(rt, "c3", "nope", {}).key)                            # invalid
     w = write(rt, "c4", body="new")
-    rt.approve(w.key, approver_id=APPROVER, args_hash=w.args_hash)
+    rt.approve(w.key, approver_id=APPROVER, action_digest=w.action_digest)
     rt.execute(w.key)                                                        # succeeded
     rt.execute(w.key)                                                        # replay: no-op
     rej = write(rt, "c5")
@@ -537,7 +570,7 @@ def _busy_history(rt, app, store):
     rt.execute(propose(rt, "c7", "read_note", {"title": "todo"}).key)        # failed
     app.read = real_read
     with pytest.raises(ApprovalRefused):
-        rt.approve(rej.key, approver_id=AGENT, args_hash=rej.args_hash)
+        rt.approve(rej.key, approver_id=AGENT, action_digest=rej.action_digest)
     return sum(app.invocations.values())
 
 
@@ -624,10 +657,10 @@ def test_tampering_with_the_latest_event_is_detected(rt, app, store):
 def test_store_refuses_unknown_fields_and_illegal_moves(rt):
     o = write(rt)
     with pytest.raises(ValueError):
-        rt.store.transition(o.key, "pending_approval", "approved", args_json="{}")
+        rt.store.transition(o.key, "awaiting_approval", "approved", action_json="{}")
     with pytest.raises(IllegalTransition):
         rt.store.transition(o.key, "succeeded", "approved")
-    assert rt.store.get_call(o.key).state == "pending_approval"
+    assert rt.store.get_call(o.key).state == "awaiting_approval"
 
 
 def test_truncation_detected_only_with_anchor(rt, app, store):

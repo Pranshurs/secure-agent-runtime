@@ -10,7 +10,6 @@ from secure_agent_runtime.contracts import (
     Effect,
     ToolRegistry,
     ToolSpec,
-    args_hash,
     canonical_json,
     validate_input,
     validate_output,
@@ -68,10 +67,6 @@ def test_canonical_json_never_coerces():
         canonical_json({"x": object()})
 
 
-def test_args_hash_is_order_independent_and_tool_bound():
-    assert args_hash("t", {"a": 1, "b": 2}) == args_hash("t", {"b": 2, "a": 1})
-    assert args_hash("t", {"a": 1}) != args_hash("u", {"a": 1})
-    assert args_hash("t", {"a": 1}) != args_hash("t", {"a": 2})
 
 
 @pytest.mark.parametrize("raw", [
