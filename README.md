@@ -168,8 +168,8 @@ tool can be reconciled. See [docs/TRANSACTION_SEMANTICS.md](docs/TRANSACTION_SEM
 
 ```bash
 pip install -e '.[dev]'
-pytest                                # TESTS_LINE
-python scripts/mutation_test.py       # MUTATION_LINE
+pytest                                # 314 tests
+python scripts/mutation_test.py       # 143 mutants: 139 killed, 0 survived, 4 equivalent
 python scripts/bench.py               # per-action overhead on your machine
 ```
 
@@ -178,7 +178,17 @@ that disables or weakens one invariant. Examples: drop the attempt fence, let a
 requirement override a forbidden glob, skip the digest re-check at dispatch. The script
 refuses to start unless the unmutated suite passes, runs every mutant on a temporary
 copy, and fails if any survives. Mutants that can't change behaviour are declared
-*equivalent* and printed with the reason, so they aren't hidden. MUTATION_DETAIL
+*equivalent* and printed with the reason, so they aren't hidden. The four equivalent mutants are:
+
+* `C10`: a no-op flag in error formatting; `C11` covers actually echoing input.
+* `S12`: a sequence check made redundant by the hash chain.
+* `R13`: a fast-path early return; the compare-and-set claim is the real guard.
+* `R48`: the attempt fence on a late worker's result. It is unreachable because
+  `reconcile` and `resolve` refuse while that worker is alive. It is kept as defence
+  in depth.
+
+The list is curated, not generated: it targets the invariants this README claims, not
+every line. CI runs it on every pull request.
 
 **Two independent adversarial reviews** (AI subagents told to break the guarantees
 through the public API) found real bugs:
@@ -195,7 +205,17 @@ named above).
 **Overhead** from `python scripts/bench.py -n 1000` on the development container
 (Python 3.11, Linux x86_64, 4 CPUs). Your numbers will differ:
 
-BENCH_TABLE
+| scenario                                       | median µs |    p95 µs |
+|------------------------------------------------|-----------|-----------|
+| direct tool call (no SAR)                      |       1.9 |       2.1 |
+| read: propose + execute, SQLite :memory:       |    1639.6 |    2199.6 |
+| read: propose + execute, SQLite file (WAL)     |    2821.1 |    3797.4 |
+| write: propose + approve + execute             |    1850.3 |    2234.3 |
+| refund: approve + execute + frame check*       |    7561.2 |   11559.6 |
+| replay of a completed action                   |     574.4 |     827.6 |
+| build receipt                                  |    1107.7 |    1329.5 |
+
+\* The refund observer snapshots the whole mock ledger, which grows from 0 to 1050 refunds during the run, so later iterations cost more.
 
 Most of the cost is one SQLite transaction per state change plus a worker thread per
 dispatch. It is fine for consequential actions (payments, deploys, file edits) and too
