@@ -82,8 +82,10 @@ receipts.
 
 ## Capacity
 
-Measure with `python scripts/bench.py` on your hardware. A thread-isolated dispatch
-costs a few SQLite transactions and a thread. A process-isolated dispatch adds a process
-start (hundreds of milliseconds with `spawn`). Use process isolation for consequential
+Measure with `python scripts/bench.py` on your hardware (the README has one run). A
+thread-isolated dispatch costs a few SQLite transactions and a thread: about 3 ms for a
+durable read there. A process-isolated dispatch adds a process start: about 150 ms there,
+with `spawn`. One runtime serialises its writes on one SQLite connection, so more threads
+don't add throughput; shard by database instead. Use process isolation for consequential
 tools, where that cost is small next to the action itself, and thread isolation for
 cheap reads.

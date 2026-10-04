@@ -191,18 +191,18 @@ compromised host.
 
 ```bash
 pip install -e '.[dev]'
-pytest                                   # @@TESTS@@
-python scripts/mutation_test.py          # @@MUTANTS@@
+pytest                                   # 451 tests
+python scripts/mutation_test.py          # 210 mutants: 203 killed, 0 survived, 7 equivalent
 python scripts/stress.py --seeds 1 2 3 4 5 6 7 8 9 10 --actions 300 --threads 16 --rounds 3
 python scripts/bench.py                  # latency and throughput on your machine
 ```
 
-**Mutation testing.** `scripts/mutation_test.py` holds @@MUTANT_N@@ deliberately
+**Mutation testing.** `scripts/mutation_test.py` holds 210 deliberately
 constructed safety mutants. Each is a hand-written change that disables or weakens one
 rule: drop the attempt fence, accept a credential twice, let a requirement override a
 forbidden glob, skip the digest re-check, never close a store. The script refuses to
 start unless the unmutated suite passes, runs every mutant on a temporary copy, and fails
-if any survives. Result: **@@MUTANT_N@@ mutants, @@KILLED@@ killed, @@EQUIV@@ demonstrated
+if any survives. Result: **210 mutants, 203 killed, 7 demonstrated
 behaviorally equivalent, 0 surviving non-equivalent mutants.** The equivalent ones are
 printed with their reasons:
 
@@ -213,8 +213,10 @@ printed with their reasons:
   unreachable because `reconcile` and `resolve` refuse while the earlier worker is alive.
 * `I3`: the token check on worker messages. Each attempt has its own pipe, written only by
   SAR's worker code with that attempt's token, so a foreign token can't arrive.
+* `W7`: the explicit "observer root must be a directory" check. `os.walk` already
+  reports a failing scan of the root to the error handler, which raises.
 
-The last three are kept as defence in depth.
+`R48`, `D9`, `I3` and `W7` are kept as defence in depth.
 
 The list is curated, not generated: it targets the rules this README claims, not every
 line. CI runs it on every pull request.
@@ -237,14 +239,59 @@ It then checks, against the ledger:
 * no forged approval is accepted;
 * no false "verified" frame.
 
-Each of those checks was shown to fail against a deliberately broken copy of SAR.
-@@STRESS@@
+The approval, receipt, tampering and frame checks were each shown to fail against a
+deliberately broken copy of SAR. One break, disabling only the per-event content hash,
+is still caught by the chain link to the next event. The command above, on the final tree, ran 30 rounds (10 seeds × 3) of 300 actions on
+16 threads in 23 minutes:
+
+* 9,000 actions and 17,976 proposals; 8,976 duplicates were absorbed.
+* 8,792 actions succeeded with exactly one effect each, and 208 were cancelled with none.
+* 898 late results were discarded.
+* 8,399 forged approvals were refused and **0 accepted**.
+* 9,000 of 9,000 receipts verified against the store, and 30 of 30 tampered database
+  copies were detected.
+* **0 invariant failures, 0 store errors, 0 unexpected exceptions.**
 
 **Reviews.** Independent cold reviews (AI subagents told to break the guarantees through
 the public API) found real bugs. Each is fixed with a regression test; see
 [docs/REVIEWS.md](docs/REVIEWS.md).
 
-**Overhead.** @@BENCH@@
+**Overhead.** `python scripts/bench.py` on the development container: CPython 3.11.15,
+Linux, an Intel Xeon @ 2.10 GHz with 4 CPUs, SQLite 3.45.1 (WAL, synchronous=FULL), idle
+(1-minute load 0.46). Each row times one operation; the script prints exactly what each
+row includes. A second run gave medians within about 8%; the process-isolated row's tail
+varies more over 30 samples. Your numbers will differ.
+
+| scenario | n | p50 µs | p95 µs | p99 µs | mean µs | ops/s |
+|---|--:|--:|--:|--:|--:|--:|
+| direct tool call (no SAR) | 2,000 | 2 | 2 | 4 | 2 | 487,791 |
+| read: propose + execute, :memory: | 2,000 | 1,971 | 2,538 | 2,951 | 2,031 | 492 |
+| replay of a completed action | 2,000 | 705 | 943 | 1,109 | 741 | 1,349 |
+| read: propose + execute, SQLite file (WAL) | 2,000 | 3,301 | 4,311 | 5,201 | 3,435 | 291 |
+| write: propose + approve + execute, file | 2,000 | 3,817 | 4,881 | 6,392 | 3,929 | 255 |
+| refund execute (thread), frame check | 500 | 8,693 | 12,097 | 14,996 | 8,684 | 115 |
+| reconcile an effect_unknown refund | 200 | 6,641 | 9,401 | 14,129 | 6,896 | 145 |
+| build receipt (unsigned) | 500 | 920 | 1,075 | 1,221 | 928 | 1,077 |
+| build receipt + Ed25519 signature | 500 | 939 | 1,147 | 1,562 | 957 | 1,045 |
+| verify receipt: Ed25519 + against the store | 500 | 31,281 | 40,327 | 44,508 | 31,897 | 31 |
+| refund execute (process-isolated) | 30 | 159,520 | 169,196 | 172,955 | 159,259 | 6 |
+| concurrent reads, 8 threads, file | 1,246 | – | – | – | – | 248 |
+
+How to read it:
+
+* **SAR's own cost is milliseconds per action, not microseconds.** A durable read costs
+  about 3.3 ms against 2.0 ms with an in-memory store, so committing to disk is a large
+  part of it; a replay, which skips the tool and the worker thread, costs 0.7 ms. That is
+  fine for consequential actions (payments, deploys, file edits) and too slow for hot
+  inner loops.
+* **A process-isolated dispatch costs about 150 ms**, mostly starting a fresh interpreter
+  with `spawn`. Use it where being able to kill the tool matters.
+* **Verifying a receipt against the store re-verifies the whole audit chain**, so its
+  cost grows with the database: about 31 ms here, on a store holding roughly 4,000
+  events.
+* **Threads don't add throughput.** One runtime has one SQLite connection, so writes are
+  serialised: 8 threads did 248 reads/s against 291/s sequentially. Shard by database for
+  more.
 
 ## Platforms
 
