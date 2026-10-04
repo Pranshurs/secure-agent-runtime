@@ -5,8 +5,8 @@
 > Models propose actions. SAR decides whether they may execute, makes retries safe,
 > reconciles uncertain outcomes, and proves what the agent changed.
 
-Status: **pre-alpha (0.2.0.dev0)**. A research and portfolio project, built openly with
-AI coding agents (Claude Code). It is not on PyPI, and nobody uses it in production.
+Status: **v0.2.0**, an early (pre-alpha) release. A research and portfolio project, built
+openly with AI coding agents (Claude Code). It is not on PyPI, and nobody uses it in production.
 
 SAR is a library that sits between an agent (any framework, any model) and the tools that
 change things. It complements agent policy and governance frameworks and durable workflow
