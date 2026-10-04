@@ -5,180 +5,595 @@
   "description": "What one agent action was authorised to do, what happened, and what it changed.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "receipt_id", "issued_at", "idempotency_key", "action", "decision", "approval",
-               "execution", "result", "effects", "outcome", "timestamps", "audit", "digest"],
+  "required": [
+    "schema",
+    "receipt_id",
+    "issued_at",
+    "idempotency_key",
+    "action",
+    "decision",
+    "approval",
+    "execution",
+    "result",
+    "effects",
+    "outcome",
+    "timestamps",
+    "audit",
+    "digest"
+  ],
   "properties": {
-    "schema": {"const": "sar.receipt/v1"},
-    "receipt_id": {"type": "string", "pattern": "^rcpt_[0-9a-f]{24}$"},
-    "issued_at": {"type": "number"},
-    "idempotency_key": {"type": "string", "minLength": 1},
+    "schema": {
+      "const": "sar.receipt/v1"
+    },
+    "receipt_id": {
+      "type": "string",
+      "pattern": "^rcpt_[0-9a-f]{24}$"
+    },
+    "issued_at": {
+      "type": "number"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1
+    },
     "action": {
       "description": "The canonical action envelope without argument values; null if the proposal was invalid.",
       "oneOf": [
-        {"type": "null"},
+        {
+          "type": "null"
+        },
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["schema", "action_id", "idempotency_key", "actor", "context", "tool", "args_digest",
-                       "authority", "frame", "created_at", "deadline", "digest"],
+          "required": [
+            "schema",
+            "action_id",
+            "idempotency_key",
+            "actor",
+            "context",
+            "tool",
+            "args_digest",
+            "authority",
+            "frame",
+            "created_at",
+            "deadline",
+            "digest"
+          ],
           "properties": {
-            "schema": {"const": "sar.action/v1"},
-            "action_id": {"type": "string", "pattern": "^act_[0-9a-f]{24}$"},
-            "idempotency_key": {"type": "string"},
-            "actor": {"type": "string"},
-            "context": {"type": "object", "required": ["run_id"], "properties": {"run_id": {"type": "string"}}},
+            "schema": {
+              "const": "sar.action/v1"
+            },
+            "action_id": {
+              "type": "string",
+              "pattern": "^act_[0-9a-f]{24}$"
+            },
+            "idempotency_key": {
+              "type": "string"
+            },
+            "actor": {
+              "type": "string"
+            },
+            "context": {
+              "type": "object",
+              "required": [
+                "run_id"
+              ],
+              "properties": {
+                "run_id": {
+                  "type": "string"
+                }
+              }
+            },
             "tool": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["name", "version", "schema_digest"],
+              "required": [
+                "name",
+                "version",
+                "schema_digest"
+              ],
               "properties": {
-                "name": {"type": "string"},
-                "version": {"type": "string"},
-                "schema_digest": {"$ref": "#/$defs/digest"}
+                "name": {
+                  "type": "string"
+                },
+                "version": {
+                  "type": "string"
+                },
+                "schema_digest": {
+                  "$ref": "#/$defs/digest"
+                }
               }
             },
-            "args_digest": {"$ref": "#/$defs/digest"},
-            "authority": {"enum": ["read", "write", "external"]},
-            "frame": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/frame"}]},
-            "created_at": {"type": "number"},
-            "deadline": {"type": ["number", "null"]},
-            "digest": {"$ref": "#/$defs/digest"}
+            "args_digest": {
+              "$ref": "#/$defs/digest"
+            },
+            "authority": {
+              "enum": [
+                "read",
+                "write",
+                "external"
+              ]
+            },
+            "frame": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/frame"
+                }
+              ]
+            },
+            "created_at": {
+              "type": "number"
+            },
+            "deadline": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "digest": {
+              "$ref": "#/$defs/digest"
+            }
           }
         }
       ]
     },
     "decision": {
       "type": "object",
-      "required": ["initial_state", "reason"],
+      "required": [
+        "initial_state",
+        "reason"
+      ],
       "properties": {
-        "initial_state": {"enum": ["invalid", "denied", "awaiting_approval", "approved", null]},
-        "reason": {"type": "string"}
+        "initial_state": {
+          "enum": [
+            "invalid",
+            "denied",
+            "awaiting_approval",
+            "approved",
+            null
+          ]
+        },
+        "reason": {
+          "type": "string"
+        }
       }
     },
     "approval": {
       "oneOf": [
-        {"type": "null"},
+        {
+          "type": "null"
+        },
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["approver", "action_digest", "approved_at", "kind", "digest"],
+          "required": [
+            "approver",
+            "action_digest",
+            "approved_at",
+            "kind",
+            "digest"
+          ],
           "properties": {
-            "approver": {"type": "string"},
-            "action_digest": {"$ref": "#/$defs/digest"},
-            "approved_at": {"type": "number"},
-            "kind": {"enum": ["human", "policy"]},
-            "digest": {"$ref": "#/$defs/digest"}
+            "approver": {
+              "type": "string"
+            },
+            "action_digest": {
+              "$ref": "#/$defs/digest"
+            },
+            "approved_at": {
+              "type": "number"
+            },
+            "kind": {
+              "enum": [
+                "human",
+                "policy"
+              ]
+            },
+            "digest": {
+              "$ref": "#/$defs/digest"
+            },
+            "auth": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "subject",
+                "method",
+                "issuer",
+                "scope",
+                "credential"
+              ],
+              "properties": {
+                "subject": {
+                  "type": "string"
+                },
+                "method": {
+                  "type": "string"
+                },
+                "issuer": {
+                  "type": "string"
+                },
+                "scope": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/$defs/digest"
+                    }
+                  ]
+                },
+                "credential": {
+                  "$ref": "#/$defs/digest"
+                }
+              }
+            }
           }
         }
       ]
     },
     "execution": {
       "type": "object",
-      "required": ["state", "reason", "dispatches", "reconciliation"],
+      "required": [
+        "state",
+        "reason",
+        "dispatches",
+        "reconciliation"
+      ],
       "properties": {
-        "state": {"enum": ["invalid", "denied", "awaiting_approval", "approved", "rejected", "expired",
-                           "cancelled", "executing", "succeeded", "failed", "output_rejected",
-                           "effect_unknown"]},
-        "reason": {"type": "string"},
-        "dispatches": {"type": "integer", "minimum": 0},
-        "reconciliation": {"type": "array", "items": {"type": "object"}}
+        "state": {
+          "enum": [
+            "invalid",
+            "denied",
+            "awaiting_approval",
+            "approved",
+            "rejected",
+            "expired",
+            "cancelled",
+            "executing",
+            "succeeded",
+            "failed",
+            "output_rejected",
+            "effect_unknown"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "dispatches": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reconciliation": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
       }
     },
     "result": {
       "type": "object",
-      "required": ["digest"],
-      "properties": {"digest": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/digest"}]}}
+      "required": [
+        "digest"
+      ],
+      "properties": {
+        "digest": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/digest"
+            }
+          ]
+        }
+      }
     },
     "effects": {
       "type": "object",
-      "required": ["declared", "before", "check"],
+      "required": [
+        "declared",
+        "before",
+        "check"
+      ],
       "properties": {
-        "declared": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/frame"}]},
-        "before": {"type": ["object", "null"], "additionalProperties": {"$ref": "#/$defs/digest"}},
+        "declared": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/frame"
+            }
+          ]
+        },
+        "before": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "$ref": "#/$defs/digest"
+          }
+        },
         "check": {
           "oneOf": [
-            {"type": "null"},
+            {
+              "type": "null"
+            },
             {
               "type": "object",
-              "required": ["verdict", "observed", "required", "allowed", "undeclared", "forbidden"],
+              "required": [
+                "verdict",
+                "observed",
+                "required",
+                "allowed",
+                "undeclared",
+                "forbidden"
+              ],
               "properties": {
-                "verdict": {"enum": ["verified", "violated", "unverifiable"]},
-                "observed": {"type": "array", "items": {
-                  "type": "object",
-                  "required": ["path", "change", "before", "after"],
-                  "properties": {
-                    "path": {"type": "string"},
-                    "change": {"enum": ["added", "modified", "deleted"]},
-                    "before": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/digest"}]},
-                    "after": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/digest"}]}
+                "verdict": {
+                  "enum": [
+                    "verified",
+                    "violated",
+                    "unverifiable"
+                  ]
+                },
+                "observed": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": [
+                      "path",
+                      "change",
+                      "before",
+                      "after"
+                    ],
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "change": {
+                        "enum": [
+                          "added",
+                          "modified",
+                          "deleted"
+                        ]
+                      },
+                      "before": {
+                        "oneOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "$ref": "#/$defs/digest"
+                          }
+                        ]
+                      },
+                      "after": {
+                        "oneOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "$ref": "#/$defs/digest"
+                          }
+                        ]
+                      }
+                    }
                   }
-                }},
-                "required": {"type": "array"},
-                "allowed": {"type": "array", "items": {"type": "string"}},
-                "undeclared": {"type": "array", "items": {"type": "string"}},
-                "forbidden": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": {
+                  "type": "array"
+                },
+                "allowed": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "undeclared": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "forbidden": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
               }
             }
           ]
         }
       }
     },
-    "outcome": {"enum": ["verified", "violated", "unverifiable", "completed", "failed", "unknown",
-                         "not_executed", "pending"]},
+    "outcome": {
+      "enum": [
+        "verified",
+        "violated",
+        "unverifiable",
+        "completed",
+        "failed",
+        "unknown",
+        "not_executed",
+        "pending"
+      ]
+    },
     "timestamps": {
       "type": "object",
-      "required": ["proposed_at", "updated_at", "first_dispatch_at"],
+      "required": [
+        "proposed_at",
+        "updated_at",
+        "first_dispatch_at"
+      ],
       "properties": {
-        "proposed_at": {"type": "number"},
-        "updated_at": {"type": "number"},
-        "first_dispatch_at": {"type": ["number", "null"]}
+        "proposed_at": {
+          "type": "number"
+        },
+        "updated_at": {
+          "type": "number"
+        },
+        "first_dispatch_at": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
       }
     },
     "audit": {
       "type": "object",
-      "required": ["events", "chain_head"],
+      "required": [
+        "events",
+        "chain_head"
+      ],
       "properties": {
-        "events": {"type": "array", "items": {
+        "events": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "seq",
+              "kind",
+              "hash"
+            ],
+            "properties": {
+              "seq": {
+                "type": "integer"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "hash": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            }
+          }
+        },
+        "chain_head": {
           "type": "object",
-          "required": ["seq", "kind", "hash"],
-          "properties": {"seq": {"type": "integer"}, "kind": {"type": "string"},
-                         "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
-        }},
-        "chain_head": {"type": "object", "required": ["seq", "hash"],
-                       "properties": {"seq": {"type": "integer"},
-                                      "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}}
+          "required": [
+            "seq",
+            "hash"
+          ],
+          "properties": {
+            "seq": {
+              "type": "integer"
+            },
+            "hash": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        }
       }
     },
-    "digest": {"$ref": "#/$defs/digest"},
+    "digest": {
+      "$ref": "#/$defs/digest"
+    },
     "signature": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["alg", "key_id", "value"],
-      "properties": {"alg": {"const": "HMAC-SHA256"}, "key_id": {"type": "string"},
-                     "value": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+      "required": [
+        "alg",
+        "key_id",
+        "value"
+      ],
+      "properties": {
+        "alg": {
+          "enum": [
+            "Ed25519",
+            "HMAC-SHA256"
+          ]
+        },
+        "key_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "value": {
+          "type": "string",
+          "pattern": "^([0-9a-f]{64}|[0-9a-f]{128})$"
+        }
+      },
+      "description": "Covers canonical JSON {alg, digest, key_id}. Ed25519: 64-byte signature, hex. HMAC-SHA256: 32-byte MAC, hex."
     }
   },
   "$defs": {
-    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
     "frame": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["required", "allowed", "forbidden"],
+      "required": [
+        "required",
+        "allowed",
+        "forbidden"
+      ],
       "properties": {
-        "required": {"type": "array", "items": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["path", "change", "count", "before_contains", "after_contains"],
-          "properties": {
-            "path": {"type": "string"},
-            "change": {"enum": ["added", "modified", "deleted"]},
-            "count": {"type": "integer", "minimum": 1},
-            "before_contains": {"type": ["string", "null"]},
-            "after_contains": {"type": ["string", "null"]}
+        "required": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "path",
+              "change",
+              "count",
+              "before_contains",
+              "after_contains"
+            ],
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "change": {
+                "enum": [
+                  "added",
+                  "modified",
+                  "deleted"
+                ]
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "before_contains": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "after_contains": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
           }
-        }},
-        "allowed": {"type": "array", "items": {"type": "string"}},
-        "forbidden": {"type": "array", "items": {"type": "string"}}
+        },
+        "allowed": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "forbidden": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
       }
     }
   }

@@ -76,6 +76,11 @@ class FileTreeObserver:
             for name in sorted(filenames) + sorted(dirnames):
                 full = Path(dirpath, name)
                 rel = full.relative_to(self.root).as_posix()
+                try:
+                    rel.encode("utf-8")
+                except UnicodeEncodeError:
+                    # A non-UTF-8 name can't be reported faithfully; refuse rather than guess.
+                    raise ValueError(f"unobservable file name under {self.root} (not valid UTF-8)") from None
                 if any(p.match(rel) or p.match(rel + "/") for p in self._ignore):
                     continue
                 st = full.lstat()
@@ -106,6 +111,7 @@ class MappingObserver:
         for rid, value in self.source().items():
             if not isinstance(rid, str):
                 raise TypeError(f"resource ids must be strings, got {type(rid).__name__}")
+            rid.encode("utf-8")  # raises on lone surrogates
             data = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
             snap[rid] = Entry(_digest(data), data if len(data) <= MAX_CONTENT else None)
         return snap
@@ -142,7 +148,7 @@ def compile_glob(pattern: str) -> re.Pattern[str]:
         else:
             out.append(re.escape(pattern[i]))
             i += 1
-    return re.compile("".join(out) + r"\Z")
+    return re.compile("".join(out) + r"\Z", re.DOTALL)  # '**' must match every character '*' can
 
 
 @dataclass(frozen=True)

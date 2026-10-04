@@ -7,16 +7,23 @@ An unsafe caller retries and refunds the customer twice. SAR records the first a
 happened (reconciliation), finds the existing refund, and closes the action with one
 refund and a verifiable receipt.
 
-Everything is local and deterministic: :class:`PaymentService` is an in-memory mock.
+Everything is local and deterministic. :class:`PaymentService` is a mock provider whose
+ledger is a SQLite file, so a refund made by a worker process (or by a runtime that was
+then killed) is visible to whoever looks next, as with a real provider.
 """
 
 from __future__ import annotations
 
-import threading
+import functools
+import os
+import sqlite3
+import tempfile
+import time
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..auth import TokenAuthenticator
 from ..contracts import Applied, Effect, NotApplied, ToolContext, ToolRegistry
 from ..effects import FrameSpec, MappingObserver, Required
 from ..policy import Policy, Principal
@@ -33,36 +40,114 @@ class ConnectionLost(Exception):
 
 
 class PaymentService:
-    """A mock payment provider. ``fail_next`` injects one fault into the next refund call:
+    """A mock payment provider backed by a SQLite ledger file.
+
+    ``fail_next`` injects one fault into the next refund call:
 
     * ``"after_effect"``: process the refund, then lose the response;
-    * ``"before_effect"``: lose the request before anything happens.
+    * ``"before_effect"``: lose the request before anything happens;
+    * ``"slow_before_effect"`` / ``"slow_after_effect"``: write ``<ledger>.inflight`` and
+      sleep (up to 30 s) before / after processing, so a test can kill whoever is waiting.
 
-    Refunds are *not* deduplicated by idempotency key here, so the demo shows SAR's
+    ``fail_reconcile_next = "slow"`` does the same inside :meth:`find_by_key`.
+    Refunds are *not* deduplicated by idempotency key, so the demo shows SAR's
     reconciliation doing the work rather than the provider.
     """
 
-    def __init__(self) -> None:
-        self.refunds: dict[str, dict[str, Any]] = {}
-        self.fail_next: str | None = None
-        self.calls = 0
-        self._lock = threading.Lock()
+    def __init__(self, path: str | None = None) -> None:
+        if path is None:
+            fd, path = tempfile.mkstemp(prefix="sar-ledger-", suffix=".db")
+            os.close(fd)
+        self.path = path
+        with self._db() as db:
+            db.execute("CREATE TABLE IF NOT EXISTS refunds (n INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER,"
+                       " amount_inr INTEGER, idempotency_key TEXT)")
+            db.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
+
+    def _db(self) -> sqlite3.Connection:
+        db = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+        db.execute("PRAGMA busy_timeout=30000")
+        return db
+
+    def _take(self, db: sqlite3.Connection, k: str) -> str | None:
+        row = db.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
+        db.execute("DELETE FROM meta WHERE k=?", (k,))
+        return row[0] if row else None
+
+    def _set(self, k: str, v: str | None) -> None:
+        with self._db() as db:
+            if v is None:
+                db.execute("DELETE FROM meta WHERE k=?", (k,))
+            else:
+                db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (k, v))
+
+    @property
+    def fail_next(self) -> str | None:
+        with self._db() as db:
+            row = db.execute("SELECT v FROM meta WHERE k='fail_next'").fetchone()
+        return row[0] if row else None
+
+    @fail_next.setter
+    def fail_next(self, value: str | None) -> None:
+        self._set("fail_next", value)
+
+    @property
+    def fail_reconcile_next(self) -> str | None:
+        return None
+
+    @fail_reconcile_next.setter
+    def fail_reconcile_next(self, value: str | None) -> None:
+        self._set("fail_reconcile_next", value)
+
+    @property
+    def calls(self) -> int:
+        with self._db() as db:
+            row = db.execute("SELECT v FROM meta WHERE k='calls'").fetchone()
+        return int(row[0]) if row else 0
+
+    def _pause(self) -> None:
+        with open(self.path + ".inflight", "w") as f:
+            f.write(str(os.getpid()))
+        time.sleep(30)
 
     def refund(self, order: int, amount_inr: int, idempotency_key: str | None = None) -> str:
-        with self._lock:
-            self.calls += 1
-            fault, self.fail_next = self.fail_next, None
+        db = self._db()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            calls = db.execute("SELECT v FROM meta WHERE k='calls'").fetchone()
+            db.execute("INSERT OR REPLACE INTO meta VALUES ('calls', ?)", (str(int(calls[0]) + 1 if calls else 1),))
+            fault = self._take(db, "fail_next")
+            db.execute("COMMIT")
             if fault == "before_effect":
                 raise ConnectionLost("request lost before processing")
-            refund_id = f"rf_{len(self.refunds) + 1:04d}"
-            self.refunds[refund_id] = {"order": order, "amount_inr": amount_inr, "idempotency_key": idempotency_key}
+            if fault == "slow_before_effect":
+                self._pause()
+            cur = db.execute("INSERT INTO refunds (order_id, amount_inr, idempotency_key) VALUES (?,?,?)",
+                             (order, amount_inr, idempotency_key))
+            refund_id = f"rf_{cur.lastrowid:04d}"
+            if fault == "slow_after_effect":
+                self._pause()
             if fault == "after_effect":
                 raise ConnectionLost("refund processed, response lost")
             return refund_id
+        finally:
+            db.close()
 
     def find_by_key(self, idempotency_key: str) -> tuple[str, dict[str, Any]] | None:
-        with self._lock:
-            return next(((rid, r) for rid, r in self.refunds.items() if r["idempotency_key"] == idempotency_key), None)
+        with self._db() as db:
+            if self._take(db, "fail_reconcile_next") == "slow":
+                self._pause()
+            row = db.execute("SELECT n, order_id, amount_inr, idempotency_key FROM refunds WHERE idempotency_key=?"
+                             " ORDER BY n LIMIT 1", (idempotency_key,)).fetchone()
+        if row is None:
+            return None
+        return f"rf_{row[0]:04d}", {"order": row[1], "amount_inr": row[2], "idempotency_key": row[3]}
+
+    @property
+    def refunds(self) -> dict[str, dict[str, Any]]:
+        with self._db() as db:
+            rows = db.execute("SELECT n, order_id, amount_inr, idempotency_key FROM refunds ORDER BY n").fetchall()
+        return {f"rf_{n:04d}": {"order": o, "amount_inr": a, "idempotency_key": k} for n, o, a, k in rows}
 
     def total_refunded(self, order: int) -> int:
         return sum(r["amount_inr"] for r in self.refunds.values() if r["order"] == order)
@@ -81,7 +166,17 @@ class RefundOut(BaseModel):
     amount_inr: int
 
 
-def build_runtime(service: PaymentService, store: Store | None = None, **kw: Any) -> Runtime:
+def _refund(service_path: str, args: RefundIn, ctx: ToolContext) -> RefundOut:
+    """Module-level so a spawned worker process can import it."""
+    rid = PaymentService(service_path).refund(args.order, args.amount_inr, idempotency_key=ctx.idempotency_key)
+    return RefundOut(refund_id=rid, order=args.order, amount_inr=args.amount_inr)
+
+
+def build_runtime(service: PaymentService, store: Store | None = None, *, isolation: str = "process",
+                  **kw: Any) -> Runtime:
+    """``isolation="process"`` (the default) runs each refund in its own worker process,
+    which is killed on timeout. ``"thread"`` runs it in-process (tests use it to swap in
+    misbehaving tools)."""
     reg = ToolRegistry()
     observer = MappingObserver(lambda: {f"refunds/{rid}": r for rid, r in service.refunds.items()})
 
@@ -90,12 +185,16 @@ def build_runtime(service: PaymentService, store: Store | None = None, **kw: Any
         return FrameSpec(required=(Required("refunds/*", "added", count=1,
                                             after_contains=f'"amount_inr":{args.amount_inr},"idempotency_key"'),))
 
-    @reg.tool(input=RefundIn, output=RefundOut, effect=Effect.EXTERNAL, version="2026-10",
-              timeout_s=2.0, observer=observer, frame=frame)
-    def refund(args: RefundIn, ctx: ToolContext) -> RefundOut:
-        """Refund an order."""
-        rid = service.refund(args.order, args.amount_inr, idempotency_key=ctx.idempotency_key)
-        return RefundOut(refund_id=rid, order=args.order, amount_inr=args.amount_inr)
+    if isolation == "process":
+        fn: Any = functools.partial(_refund, service.path)
+    else:
+        def fn(args: RefundIn, ctx: ToolContext) -> RefundOut:
+            rid = service.refund(args.order, args.amount_inr, idempotency_key=ctx.idempotency_key)
+            return RefundOut(refund_id=rid, order=args.order, amount_inr=args.amount_inr)
+
+    reg.tool(name="refund", input=RefundIn, output=RefundOut, effect=Effect.EXTERNAL, version="2026-10",
+             timeout_s=10.0 if isolation == "process" else 2.0, observer=observer, frame=frame,
+             isolation=isolation)(fn)
 
     @reg.reconciler("refund")
     def find_refund(args: RefundIn, ctx: ToolContext) -> Applied | NotApplied:
@@ -105,8 +204,16 @@ def build_runtime(service: PaymentService, store: Store | None = None, **kw: Any
         rid, r = found
         return Applied(RefundOut(refund_id=rid, order=r["order"], amount_inr=r["amount_inr"]))
 
-    return Runtime(registry=reg, policy=Policy(), store=store or Store(), principals=[
+    store = store or Store()
+    kw.setdefault("authenticator", TokenAuthenticator(now=store.now))
+    return Runtime(registry=reg, policy=Policy(), store=store, principals=[
         Principal(AGENT, grants=frozenset({"refund"})), Principal(APPROVER, can_approve=True)], **kw)
+
+
+def approve_as_finance(rt: Runtime, o: Any) -> Any:
+    """The finance lead approves exactly the action they were shown."""
+    token = rt.authenticator.issue(APPROVER, scope=o.action_digest)  # minted for this action only
+    return rt.approve(o.key, credential=token, action_digest=o.action_digest)
 
 
 def unsafe_retry(service: PaymentService, order: int, amount_inr: int, attempts: int = 2) -> None:
@@ -126,7 +233,7 @@ def run_sar(service: PaymentService, *, fault: str, store: Store | None = None) 
     args = {"order": 821, "amount_inr": 4500}
     o = rt.propose(run_id="ticket-77", principal_id=AGENT, call_id="call_1", tool="refund", arguments=args)
     trace.append(f"proposed refund(order=821, amount_inr=4500) -> {o.state}")
-    rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest)
+    approve_as_finance(rt, o)
     trace.append(f"{APPROVER} approved action {o.action_digest[:23]}...")
     service.fail_next = fault
     out = rt.execute(o.key)
@@ -154,17 +261,34 @@ def main() -> None:  # pragma: no cover - exercised by tests/test_demos.py via s
     for fault, title in (("after_effect", "SAR, response lost AFTER the refund"),
                          ("before_effect", "SAR, request lost BEFORE the refund")):
         service = PaymentService()
-        rt, key, trace = run_sar(service, fault=fault)
+        rt, key, trace = run_sar(service, fault=fault, store=_temp_store())
         print(title)
         for line in trace:
             print("  " + line)
-        receipt = rt.receipt(key, signing_key=b"demo-key")
-        problems = verify_receipt(receipt, signing_key=b"demo-key", store=rt.store)
+        signer, keys = _demo_signer()
+        receipt = rt.receipt(key, signer=signer)
+        problems = verify_receipt(receipt, store=rt.store, expect_key=key, **keys)
         print(f"  refunds issued: {len(service.refunds)}   total refunded: ₹{service.total_refunded(821):,}"
               f"   provider calls: {service.calls}")
         print(f"  receipt {receipt['receipt_id']}: outcome {receipt['outcome'].upper()}, "
-              f"dispatches {receipt['execution']['dispatches']}, "
+              f"dispatches {receipt['execution']['dispatches']}, {receipt['signature']['alg']} signature, "
               f"verification {'OK' if not problems else problems}\n")
+
+
+def _temp_store() -> Store:
+    return Store(os.path.join(tempfile.mkdtemp(prefix="sar-demo-"), "sar.db"))
+
+
+def _demo_signer() -> tuple[Any, dict[str, Any]]:
+    """Ed25519 when the 'signing' extra is installed, else HMAC with a random key."""
+    from ..signing import Ed25519Signer, HmacSigner
+
+    try:
+        signer = Ed25519Signer.generate("demo-ed25519")
+        return signer, {"public_keys": {signer.key_id: signer.public_key_bytes()}}
+    except Exception:
+        key = os.urandom(32)
+        return HmacSigner(key, "demo-hmac"), {"signing_key": key}
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -10,12 +10,13 @@ Integrity has two layers:
 
 * ``digest`` is SHA-256 over the canonical JSON of the receipt without ``digest`` and
   ``signature``, so any edit to the receipt is detectable.
-* ``signature`` (optional) is HMAC-SHA256 over the digest with an operator key. HMAC is
-  symmetric: whoever can verify can also forge. Use it inside one trust domain; a public
-  verifier needs an asymmetric signature, which is not implemented yet.
+* ``signature`` (optional) covers ``{alg, key_id, digest}``. ``Ed25519`` lets anyone
+  holding the public key verify, and only the private-key holder sign; ``HMAC-SHA256``
+  is symmetric (see :mod:`.signing`).
 
-:func:`verify_receipt` checks both, and, given the store, that the audit events the
-receipt names are still in a valid chain with the same hashes.
+:func:`verify_receipt` checks the digest, the signature against the keys it is given,
+optionally that the receipt is for an expected action, and, given the store, that the
+receipt matches the store and the store's state is backed by its audit log.
 
 The schema is ``sar.receipt/v1``; its JSON Schema ships as
 ``secure_agent_runtime/schemas/agent-receipt-v1.schema.json``.
@@ -24,14 +25,14 @@ The schema is ``sar.receipt/v1``; its JSON Schema ships as
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 from importlib import resources
 from typing import Any
 
 from .action import sha256_text
 from .contracts import canonical_json
-from .store import Store
+from .signing import HmacSigner, verify_ed25519
+from .store import Store, approval_digest
 
 RECEIPT_SCHEMA = "sar.receipt/v1"
 
@@ -55,8 +56,12 @@ def _outcome(state: str, frame: dict[str, Any] | None, dispatches: int) -> str:
     return "pending"  # awaiting_approval, approved, executing
 
 
-def build_receipt(store: Store, key: str, *, signing_key: bytes | None = None,
+def build_receipt(store: Store, key: str, *, signer: Any = None, signing_key: bytes | None = None,
                   key_id: str = "default") -> dict[str, Any]:
+    """``signer`` is an :class:`~.signing.Ed25519Signer` or :class:`~.signing.HmacSigner`;
+    ``signing_key`` is shorthand for an HMAC signer."""
+    if signer is None and signing_key is not None:
+        signer = HmacSigner(signing_key, key_id)
     row = store.get_call(key)
     if row is None:
         raise KeyError(f"no action {key!r}")
@@ -95,9 +100,8 @@ def build_receipt(store: Store, key: str, *, signing_key: bytes | None = None,
     if row.approval is not None:
         body["approval"] = {**row.approval, "digest": sha256_text(canonical_json(row.approval))}
     body["digest"] = receipt_digest(body)
-    if signing_key is not None:
-        body["signature"] = {"alg": "HMAC-SHA256", "key_id": key_id,
-                             "value": hmac.new(signing_key, body["digest"].encode(), hashlib.sha256).hexdigest()}
+    if signer is not None:
+        body["signature"] = {"alg": signer.alg, "key_id": signer.key_id, "value": signer.sign(body["digest"])}
     return body
 
 
@@ -109,26 +113,33 @@ def receipt_digest(receipt: dict[str, Any]) -> str:
 _NOT_SEMANTIC = frozenset({"issued_at", "receipt_id", "digest", "signature", "audit"})
 
 
-def verify_receipt(receipt: Any, *, signing_key: bytes | None = None, store: Store | None = None) -> list[str]:
+def verify_receipt(receipt: Any, *, signing_key: bytes | None = None,
+                   public_keys: dict[str, bytes] | None = None, store: Store | None = None,
+                   expect_action_digest: str | None = None, expect_key: str | None = None) -> list[str]:
     """Problems found; an empty list means the receipt verified at every level requested.
 
     * Always: the digest matches the content (integrity, not authorship).
-    * With ``signing_key``: an HMAC-SHA256 signature is present and valid.
-    * With ``store``: the audit chain verifies up to the receipt's chain head, the receipt
-      lists exactly the store's events for this action up to that head, and every other
-      field equals what the store says now. A receipt issued before the action changed
-      again is reported as stale.
+    * ``public_keys`` (``{key_id: raw 32-byte Ed25519 public key}``) or ``signing_key``
+      (HMAC): a signature is required, made with a key the verifier trusts for that
+      ``key_id`` and that algorithm.
+    * ``expect_action_digest`` / ``expect_key``: the receipt is about that action, so a
+      valid receipt for another action can't be passed off as this one's.
+    * ``store``: the audit chain verifies up to the receipt's chain head, the receipt
+      lists exactly the store's events for this action, the stored state and approval
+      are backed by those events, and every other field equals what the store says
+      now. A receipt issued before the action changed again is reported as stale.
 
-    Without a key, a receipt whose signature was stripped or left stale still passes the
-    digest check: only a key (or the store) proves who issued it.
+    Without any key, a receipt whose signature was stripped or left stale still passes
+    the digest check: only a key (or the store) says who issued it.
     """
     try:
-        return _verify(receipt, signing_key, store)
+        return _verify(receipt, signing_key, public_keys, store, expect_action_digest, expect_key)
     except Exception as exc:  # malformed input must give a verdict, not a crash
         return [f"malformed receipt: {type(exc).__name__}"]
 
 
-def _verify(receipt: Any, signing_key: bytes | None, store: Store | None) -> list[str]:
+def _verify(receipt: Any, signing_key: bytes | None, public_keys: dict[str, bytes] | None, store: Store | None,
+            expect_action_digest: str | None, expect_key: str | None) -> list[str]:
     problems: list[str] = []
     if not isinstance(receipt, dict) or receipt.get("schema") != RECEIPT_SCHEMA:
         return [f"not a {RECEIPT_SCHEMA} receipt"]
@@ -138,14 +149,13 @@ def _verify(receipt: Any, signing_key: bytes | None, store: Store | None) -> lis
         return ["receipt is not plain JSON"]
     if receipt.get("digest") != digest:
         problems.append("digest does not match the receipt's content")
-    sig = receipt.get("signature")
-    if signing_key is not None:
-        if not isinstance(sig, dict) or sig.get("alg") != "HMAC-SHA256":
-            problems.append("receipt is not signed with HMAC-SHA256")
-        else:
-            expected = hmac.new(signing_key, str(receipt.get("digest")).encode(), hashlib.sha256).hexdigest()
-            if not hmac.compare_digest(expected.encode(), str(sig.get("value")).encode("utf-8", "replace")):
-                problems.append("signature does not verify")
+    if signing_key is not None or public_keys is not None:
+        problems += _signature_problems(receipt, signing_key, public_keys)
+    action = receipt.get("action") or {}
+    if expect_action_digest is not None and action.get("digest") != expect_action_digest:
+        problems.append("receipt is for a different action")
+    if expect_key is not None and receipt.get("idempotency_key") != expect_key:
+        problems.append("receipt is for a different idempotency key")
     if store is None:
         return problems
 
@@ -158,7 +168,6 @@ def _verify(receipt: Any, signing_key: bytes | None, store: Store | None) -> lis
     row = store.get_call(key)
     if row is None:
         return problems + ["action not found in store"]
-    action = receipt.get("action") or {}
     if action and row.action_digest != action.get("digest"):
         problems.append("stored action digest differs from the receipt")
     stored = store.events(call_key=key)
@@ -171,6 +180,7 @@ def _verify(receipt: Any, signing_key: bytes | None, store: Store | None) -> lis
                 problems.append(f"audit event {ev.get('seq')} is missing or differs")
         if not any(p.startswith("audit event") for p in problems):
             problems.append("receipt does not list exactly this action's audit events")
+    problems += _row_backed_by_events(row, stored)
     if len(stored) > len(upto):
         problems.append("stale receipt: the action changed after it was issued")
         return problems
@@ -179,3 +189,39 @@ def _verify(receipt: Any, signing_key: bytes | None, store: Store | None) -> lis
         if field not in _NOT_SEMANTIC and fresh.get(field) != receipt.get(field):
             problems.append(f"{field} differs from the store")
     return problems
+
+
+_NON_STATE_EVENTS = frozenset({"call.requested", "call.replayed", "call.replay_divergence",
+                               "call.late_result_discarded"})
+
+
+def _row_backed_by_events(row: Any, events: list[Any]) -> list[str]:
+    """The call row isn't hash-chained; its state and approval must agree with events that are."""
+    problems = []
+    states = [e for e in events if e.kind.startswith("call.") and e.kind not in _NON_STATE_EVENTS]
+    if not states or states[-1].kind != f"call.{row.state}":
+        problems.append("stored state is not backed by the audit log")
+    if row.approval is not None:
+        approved = [e for e in events if e.kind == "call.approved"]
+        if not approved or approved[-1].data.get("approval_digest") != approval_digest(row.approval):
+            problems.append("stored approval is not backed by the audit log")
+    return problems
+
+
+def _signature_problems(receipt: dict[str, Any], signing_key: bytes | None,
+                        public_keys: dict[str, bytes] | None) -> list[str]:
+    sig = receipt.get("signature")
+    if not isinstance(sig, dict) or not all(isinstance(sig.get(k), str) for k in ("alg", "key_id", "value")):
+        return ["receipt is not signed"]
+    alg, kid, value, digest = sig["alg"], sig["key_id"], sig["value"], str(receipt.get("digest"))
+    if alg == "Ed25519":
+        if public_keys is None:
+            return ["receipt is signed with Ed25519 but no public keys were given"]
+        if kid not in public_keys:
+            return [f"unknown signing key id {kid!r}"]
+        return [] if verify_ed25519(public_keys[kid], digest, kid, value) else ["signature does not verify"]
+    if alg == "HMAC-SHA256":
+        if signing_key is None:
+            return ["receipt is signed with HMAC-SHA256 but no HMAC key was given"]
+        return [] if HmacSigner(signing_key, kid).verify(digest, kid, value) else ["signature does not verify"]
+    return [f"unsupported signature algorithm {alg!r}"]

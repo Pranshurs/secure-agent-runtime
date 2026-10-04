@@ -13,7 +13,9 @@ from secure_agent_runtime.examples import version_bump as vb
 from secure_agent_runtime.examples.notes import AGENT
 from secure_agent_runtime.receipts import receipt_json_schema, verify_receipt
 
-KEY = b"operator-secret"
+from .conftest import cred
+
+KEY = b"operator-secret-0123456789abcdef"
 SCHEMA = receipt_json_schema()
 
 
@@ -27,7 +29,7 @@ def refunded(store):
     rt = rf.build_runtime(service, store)
     o = rt.propose(run_id="t", principal_id=rf.AGENT, call_id="c", tool="refund",
                    arguments={"order": 821, "amount_inr": 4500})
-    rt.approve(o.key, approver_id=rf.APPROVER, action_digest=o.action_digest)
+    rt.approve(o.key, credential=cred(rt, rf.APPROVER), action_digest=o.action_digest)
     service.fail_next = "after_effect"
     rt.execute(o.key)
     rt.reconcile(o.key)
@@ -92,12 +94,12 @@ def test_recomputed_digest_without_the_key_fails_the_signature(refunded):
     forged["digest"] = receipt_digest(forged)
     assert verify_receipt(forged) == []  # a digest alone proves integrity, not authorship
     assert verify_receipt(forged, signing_key=KEY) == ["signature does not verify"]
-    assert verify_receipt(forged, signing_key=b"other") == ["signature does not verify"]
+    assert verify_receipt(forged, signing_key=b"other-key-0123456789") == ["signature does not verify"]
 
 
 def test_unsigned_receipt_fails_when_a_signature_is_required(refunded):
     rt, key = refunded
-    assert verify_receipt(rt.receipt(key), signing_key=KEY) == ["receipt is not signed with HMAC-SHA256"]
+    assert verify_receipt(rt.receipt(key), signing_key=KEY) == ["receipt is not signed"]
 
 
 def test_receipt_is_bound_to_the_audit_chain(refunded):
@@ -201,7 +203,7 @@ def test_stale_receipt_is_reported(store):
                    arguments={"order": 1, "amount_inr": 1})
     early = rt.receipt(o.key)
     assert early["outcome"] == "pending" and verify_receipt(early, store=store) == []
-    rt.approve(o.key, approver_id=rf.APPROVER, action_digest=o.action_digest)
+    rt.approve(o.key, credential=cred(rt, rf.APPROVER), action_digest=o.action_digest)
     assert verify_receipt(early, store=store) == ["stale receipt: the action changed after it was issued"]
 
 

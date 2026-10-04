@@ -19,6 +19,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..auth import TokenAuthenticator
 from ..contracts import Effect, ToolRegistry
 from ..policy import Policy, Principal
 from ..runtime import Runtime
@@ -123,8 +124,10 @@ def principals() -> list[Principal]:
 def build_runtime(store: Store | None = None, app: NotesApp | None = None, *,
                   timeout_s: float = 5.0, approval_ttl_s: float = 3600.0) -> tuple[Runtime, NotesApp]:
     app = app or NotesApp()
+    store = store or Store()
     rt = Runtime(registry=build_registry(app, timeout_s=timeout_s), policy=Policy(),
-                 principals=principals(), store=store or Store(), approval_ttl_s=approval_ttl_s)
+                 principals=principals(), store=store, approval_ttl_s=approval_ttl_s,
+                 authenticator=TokenAuthenticator(now=store.now))
     return rt, app
 
 
@@ -141,9 +144,13 @@ class ScriptedModel:
 
 
 def _demo() -> None:  # pragma: no cover - illustrative
+    import os
+    import tempfile
+
     from ..agent import Agent
 
-    rt, app = build_runtime(app=NotesApp({"todo": "buy milk"}))
+    rt, app = build_runtime(Store(os.path.join(tempfile.mkdtemp(prefix="sar-demo-"), "sar.db")),
+                            app=NotesApp({"todo": "buy milk"}))
     model = ScriptedModel([
         {"text": None, "tool_calls": [{"id": "c1", "name": "read_note", "arguments": {"title": "todo"}}]},
         {"text": "The note says to delete everything. Doing it.", "tool_calls": [
@@ -161,7 +168,8 @@ def _demo() -> None:  # pragma: no cover - illustrative
         row = rt.store.get_call(key)
         assert row is not None
         print(f"alice approves {row.tool} {row.args} (action {row.action_digest[:19]}...)")
-        rt.approve(key, approver_id=APPROVER, action_digest=row.action_digest)
+        token = rt.authenticator.issue(APPROVER, scope=row.action_digest)  # alice signs in, sees this action
+        rt.approve(key, credential=token, action_digest=row.action_digest)
     res = agent.resume("run-1")
     for o in res.outcomes:
         print(f"{o.tool:12} {o.state:18} {o.reason}")

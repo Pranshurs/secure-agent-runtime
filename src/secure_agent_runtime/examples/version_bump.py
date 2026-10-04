@@ -23,6 +23,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..auth import TokenAuthenticator
 from ..contracts import Effect, ToolRegistry
 from ..effects import FileTreeObserver, FrameSpec, Required
 from ..policy import Policy, Principal
@@ -93,8 +94,10 @@ def build_runtime(root: Path, agent: Callable[[Path, BumpIn], list[str]], store:
         """Bump the project version."""
         return BumpOut(files_written=agent(root, args))
 
-    return Runtime(registry=reg, policy=Policy(), store=store or Store(), principals=[
-        Principal(AGENT, grants=frozenset({"bump_version"})), Principal(APPROVER, can_approve=True)])
+    store = store or Store()
+    return Runtime(registry=reg, policy=Policy(), store=store, authenticator=TokenAuthenticator(now=store.now),
+                   principals=[Principal(AGENT, grants=frozenset({"bump_version"})),
+                               Principal(APPROVER, can_approve=True)])
 
 
 def conventional_check(root: Path) -> bool:
@@ -102,11 +105,12 @@ def conventional_check(root: Path) -> bool:
     return 'version = "2.1.1"' in (root / "pyproject.toml").read_text()
 
 
-def run(agent: Callable[[Path, BumpIn], list[str]], root: Path) -> tuple[Runtime, str]:
-    rt = build_runtime(make_workspace(root), agent)
+def run(agent: Callable[[Path, BumpIn], list[str]], root: Path, store: Store | None = None) -> tuple[Runtime, str]:
+    rt = build_runtime(make_workspace(root), agent, store)
     o = rt.propose(run_id="release", principal_id=AGENT, call_id="bump", tool="bump_version",
                    arguments={"from_version": "2.1.0", "to_version": "2.1.1"})
-    rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest)
+    rt.approve(o.key, credential=rt.authenticator.issue(APPROVER, scope=o.action_digest),
+               action_digest=o.action_digest)
     rt.execute(o.key)
     return rt, o.key
 
@@ -116,12 +120,12 @@ def main() -> None:  # pragma: no cover - exercised by tests/test_demos.py via s
     for label, agent in (("careful agent", careful_agent), ("sloppy agent", sloppy_agent)):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            rt, key = run(agent, root)
+            rt, key = run(agent, root / "ws", Store(str(root / "sar.db")))
             receipt = rt.receipt(key)
             check = receipt["effects"]["check"]
             met = all(r["met"] for r in check["required"])
             print(f"{label.upper()}")
-            print(f"  conventional outcome check:  {'PASS' if conventional_check(root) else 'FAIL'}")
+            print(f"  conventional outcome check:  {'PASS' if conventional_check(root / 'ws') else 'FAIL'}")
             print(f"  REQUIRED EFFECTS:            {'PASS' if met else 'FAIL'}")
             print(f"  UNDECLARED CHANGES:          {len(check['undeclared'])} {check['undeclared'] or ''}")
             print(f"  FORBIDDEN EFFECTS:           {len(check['forbidden'])} {check['forbidden'] or ''}")

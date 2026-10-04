@@ -9,6 +9,8 @@ import sys
 
 import pytest
 
+from .conftest import cred
+
 
 def cli(*args, env=None):
     return subprocess.run([sys.executable, "-m", "secure_agent_runtime", *args], capture_output=True, text=True,
@@ -47,17 +49,17 @@ def receipt_file(tmp_path, store):
     rt = rf.build_runtime(rf.PaymentService(), store)
     o = rt.propose(run_id="t", principal_id=rf.AGENT, call_id="c", tool="refund",
                    arguments={"order": 1, "amount_inr": 10})
-    rt.approve(o.key, approver_id=rf.APPROVER, action_digest=o.action_digest)
+    rt.approve(o.key, credential=cred(rt, rf.APPROVER), action_digest=o.action_digest)
     rt.execute(o.key)
     path = tmp_path / "receipt.json"
-    path.write_text(json.dumps(rt.receipt(o.key, signing_key=b"k3y")))
+    path.write_text(json.dumps(rt.receipt(o.key, signing_key=b"k3y-0123456789abcdef")))
     return path
 
 
 def test_verify_receipt_cli(receipt_file):
-    ok = cli("verify-receipt", str(receipt_file), "--key-env", "SAR_KEY", env={"SAR_KEY": "k3y"})
+    ok = cli("verify-receipt", str(receipt_file), "--key-env", "SAR_KEY", env={"SAR_KEY": "k3y-0123456789abcdef"})
     assert ok.returncode == 0 and "signature verified" in ok.stdout
-    bad = cli("verify-receipt", str(receipt_file), "--key-env", "SAR_KEY", env={"SAR_KEY": "wrong"})
+    bad = cli("verify-receipt", str(receipt_file), "--key-env", "SAR_KEY", env={"SAR_KEY": "wrong-key-0123456789"})
     assert bad.returncode == 1 and "signature does not verify" in bad.stdout
     r = json.loads(receipt_file.read_text())
     r["outcome"] = "violated"

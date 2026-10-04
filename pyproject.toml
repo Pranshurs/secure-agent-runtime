@@ -22,7 +22,14 @@ classifiers = [
 secure-agent-runtime = "secure_agent_runtime.__main__:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.6", "jsonschema>=4.18"]
+# Ed25519-signed Agent Receipts.
+signing = ["cryptography>=42"]
+# OpenTelemetry spans and metrics (API only; bring your own SDK/exporter).
+otel = ["opentelemetry-api>=1.27"]
+dev = [
+    "pytest>=8", "pytest-timeout>=2.3", "hypothesis>=6.100", "ruff>=0.6", "mypy>=1.10", "jsonschema>=4.18",
+    "cryptography>=42", "opentelemetry-api>=1.27", "opentelemetry-sdk>=1.27",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/secure_agent_runtime"]
@@ -30,6 +37,7 @@ packages = ["src/secure_agent_runtime"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --strict-markers"
+timeout = 300
 filterwarnings = ["error"]
 
 [tool.ruff]

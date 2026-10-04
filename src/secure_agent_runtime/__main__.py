@@ -1,7 +1,9 @@
 """Command line: ``python -m secure_agent_runtime`` (also installed as ``secure-agent-runtime``).
 
     demo [refund|frame|notes|all]      run the deterministic demos
-    verify-receipt FILE [--key-env V]  check a receipt's digest (and HMAC, if a key is given)
+    verify-receipt FILE [--public-key ID=HEX | --key-env V]
+                                       check a receipt's digest and, given a key, its signature
+                                       (exit 0 ok, 1 failed verification, 2 could not check)
     schema                             print the Agent Receipt JSON Schema
 """
 
@@ -10,7 +12,21 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
 import sys
+
+MAX_RECEIPT_BYTES = 4 * 1024 * 1024
+
+
+def _read_receipt(path: str) -> object:
+    st = os.stat(path)
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError("not a regular file")
+    if st.st_size > MAX_RECEIPT_BYTES:
+        raise ValueError(f"larger than {MAX_RECEIPT_BYTES} bytes")
+    with open(path, "rb") as f:
+        data = f.read(MAX_RECEIPT_BYTES + 1)
+    return json.loads(data.decode("utf-8"))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -22,6 +38,7 @@ def main(argv: list[str] | None = None) -> int:
     ver = sub.add_parser("verify-receipt", help="verify an Agent Receipt JSON file")
     ver.add_argument("file")
     ver.add_argument("--key-env", help="environment variable holding the HMAC key")
+    ver.add_argument("--public-key", help="KEY_ID=HEX trusted Ed25519 public key (raw 32 bytes, hex)")
     sub.add_parser("schema", help="print the Agent Receipt JSON Schema")
     ns = ap.parse_args(argv)
 
@@ -38,22 +55,35 @@ def main(argv: list[str] | None = None) -> int:
     if ns.cmd == "verify-receipt":
         from .receipts import verify_receipt
 
-        with open(ns.file, encoding="utf-8") as f:
-            receipt = json.load(f)
-        key = None
+        # Exit codes: 0 verified, 1 the receipt failed verification, 2 could not check.
+        try:
+            receipt = _read_receipt(ns.file)
+        except (OSError, ValueError, RecursionError) as exc:
+            print(f"ERROR: cannot read receipt: {exc}", file=sys.stderr)
+            return 2
+        kwargs: dict[str, object] = {}
         if ns.key_env:
             value = os.environ.get(ns.key_env)
             if not value:
-                print(f"environment variable {ns.key_env} is not set", file=sys.stderr)
+                print(f"ERROR: environment variable {ns.key_env} is not set", file=sys.stderr)
                 return 2
-            key = value.encode()
-        problems = verify_receipt(receipt, signing_key=key)
+            kwargs["signing_key"] = value.encode()
+        if ns.public_key:
+            try:
+                key_id, hexkey = ns.public_key.split("=", 1)
+                kwargs["public_keys"] = {key_id: bytes.fromhex(hexkey)}
+            except ValueError:
+                print("ERROR: --public-key must be KEY_ID=HEX", file=sys.stderr)
+                return 2
+        problems = verify_receipt(receipt, **kwargs)  # type: ignore[arg-type]
         if problems:
             for p in problems:
                 print(f"FAIL: {p}")
             return 1
+        signed = "signing_key" in kwargs or "public_keys" in kwargs
         print(f"OK: {receipt['receipt_id']} outcome={receipt['outcome']}"
-              + (" (signature verified)" if key else " (digest only; pass --key-env to check the signature)"))
+              + (" (signature verified)" if signed else " (digest only; pass --public-key or --key-env to "
+                                                        "check who signed it)"))
         return 0
     if ns.cmd == "schema":
         from .receipts import receipt_json_schema

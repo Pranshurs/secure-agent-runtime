@@ -24,6 +24,7 @@ import hashlib
 import inspect
 import json
 import math
+import pickle
 import re
 import threading
 from collections.abc import Callable
@@ -110,6 +111,10 @@ class ToolSpec:
     reconciler: Callable[[Any, ToolContext], Reconciliation] | None = None
     observer: Any = None  # an effects.Observer
     frame: Callable[[Any], Any] | None = None  # args model -> effects.FrameSpec
+    # "thread": run in-process (a timed-out tool cannot be stopped). "process": run each
+    # dispatch in a fresh worker process that is killed on timeout; fn and both models
+    # must then be importable (module-level), because they are pickled by reference.
+    isolation: str = "thread"
 
     def __post_init__(self) -> None:
         if not self.name or not self.name.replace("_", "").replace("-", "").isalnum():
@@ -130,6 +135,16 @@ class ToolSpec:
             raise ContractError(f"{self.name}: a READ tool has no effect to reconcile")
         if (self.frame is None) != (self.observer is None):
             raise ContractError(f"{self.name}: frame and observer must be given together")
+        if self.isolation not in ("thread", "process"):
+            raise ContractError(f"{self.name}: isolation must be 'thread' or 'process'")
+        if self.isolation == "process":
+            for label, obj in (("fn", self.fn), ("input model", self.input_model),
+                               ("output model", self.output_model)):
+                try:
+                    pickle.dumps(obj)
+                except Exception as exc:
+                    raise ContractError(f"{self.name}: process isolation needs an importable {label} "
+                                        f"(module-level, not a closure): {type(exc).__name__}") from exc
 
     @property
     def schema_digest(self) -> str:
@@ -164,7 +179,8 @@ class ToolRegistry:
 
     def tool(self, *, name: str | None = None, input: type[BaseModel], output: type[BaseModel],
              effect: Effect, version: str = "1", timeout_s: float = 10.0, observer: Any = None,
-             frame: Callable[[Any], Any] | None = None) -> Callable[[Callable[..., Any]], ToolSpec]:
+             frame: Callable[[Any], Any] | None = None,
+             isolation: str = "thread") -> Callable[[Callable[..., Any]], ToolSpec]:
         """Decorator form of :meth:`register`. The tool gets a ``ToolContext`` if its second
         parameter is named ``ctx``."""
 
@@ -174,7 +190,7 @@ class ToolRegistry:
                 name=name or fn.__name__, input_model=input, output_model=output, fn=fn,
                 effect=effect, version=version, timeout_s=timeout_s,
                 description=inspect.getdoc(fn) or "", takes_ctx="ctx" in params,
-                observer=observer, frame=frame,
+                observer=observer, frame=frame, isolation=isolation,
             ))
 
         return wrap
@@ -298,9 +314,15 @@ def _loc(parts: tuple[Any, ...]) -> str:
     return ".".join(str(p) if _SAFE_LOC.match(str(p)) else "<field>" for p in parts) or "(root)"
 
 
+# Error types whose message is written by the operator's validator and may quote the input
+# (``ValueError(f"bad card {x}")``); their text is never echoed.
+_OPAQUE = frozenset({"value_error", "assertion_error"})
+
+
 def _short(exc: ValidationError) -> str:
-    # Field locations and pydantic's messages only; never echo the offending input back.
-    return "; ".join(f"{_loc(e['loc'])}: {e['msg']}" for e in exc.errors(include_input=False))[:500]
+    # Field locations and pydantic's own messages only; never echo the offending input back.
+    return "; ".join(f"{_loc(e['loc'])}: {'rejected by validator' if e['type'] in _OPAQUE else e['msg']}"
+                     for e in exc.errors(include_input=False))[:500]
 
 
 def invoke(spec: ToolSpec, model: BaseModel, ctx: ToolContext) -> Any:

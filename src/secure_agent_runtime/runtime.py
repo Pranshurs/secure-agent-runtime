@@ -20,6 +20,7 @@ all supplied by the operator, plus the validated arguments. Model text never rea
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import threading
@@ -29,7 +30,8 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from .action import Action, action_id_for, sha256_text
+from .action import Action, action_id_for, new_salt, sha256_text
+from .auth import AuthContext, Authenticator
 from .contracts import (
     Applied,
     Effect,
@@ -47,17 +49,14 @@ from .contracts import (
     validate_output,
 )
 from .effects import FrameSpec, Snapshot, check_frame, digests, from_digests
+from .errors import CredentialReused, SARError
 from .policy import Policy, Principal, Verdict, approval_refusal
-from .store import CallRow, Store
+from .store import CallRow, Store, approval_digest
 
 POLICY_APPROVER = "policy:allow"
 MAX_ID_LEN = 256
 
 log = logging.getLogger(__name__)
-
-
-class SARError(Exception):
-    pass
 
 
 class MalformedProposal(SARError):
@@ -121,26 +120,47 @@ _UNVERIFIABLE = {"verdict": "unverifiable", "observed": [], "required": [], "all
 
 class Runtime:
     def __init__(self, *, registry: ToolRegistry, policy: Policy, principals: Iterable[Principal],
-                 store: Store, approval_ttl_s: float = 3600.0,
+                 store: Store, authenticator: Authenticator | None = None, approval_ttl_s: float = 3600.0,
+                 max_stuck_workers: int = 32, recover_on_start: bool = True,
                  faults: Callable[[str, str], None] | None = None) -> None:
         """``faults(point, key)`` is a fault-injection hook called at execution boundaries.
         Raising from it simulates a crash there: at ``after_claim`` the exception propagates
         out of ``execute`` with the action claimed but not dispatched; at ``after_effect``
-        the worker exits after the tool returned, without recording the result."""
+        the worker exits after the tool returned, without recording the result.
+
+        ``authenticator`` turns approval credentials into an :class:`AuthContext`; without
+        one, ``approve``/``reject``/``resolve`` refuse. ``approval_ttl_s`` bounds both the
+        window to approve and the time an approval stays valid for dispatch.
+        ``recover_on_start`` runs :meth:`recover` immediately: the store has a single owner
+        (see :class:`Store`), so any action still ``executing`` is an orphan of a crash."""
         if approval_ttl_s <= 0:
             raise ValueError("approval_ttl_s must be positive")
+        store.attach(self)
+        self.authenticator = authenticator
+        self.max_stuck_workers = max_stuck_workers
         self.registry = registry
         self.policy = policy
         self.store = store
         self.approval_ttl_s = approval_ttl_s
         self._faults = faults or (lambda point, key: None)
         self._before: dict[str, tuple[int, Snapshot]] = {}  # key -> (attempt, pre-dispatch snapshot)
-        self._live: dict[str, threading.Thread] = {}  # key -> worker of the latest dispatch
+        self._live: dict[str, Any] = {}  # key -> worker (thread or process) of the latest dispatch
         self._principals: dict[str, Principal] = {}
         for p in principals:
             if p.id in self._principals or p.id == POLICY_APPROVER:
                 raise ValueError(f"duplicate or reserved principal id {p.id!r}")
             self._principals[p.id] = p
+        if store.path == ":memory:" and any(_effectful(registry.get(n)) for n in registry.names()):
+            log.warning("SAR is using an in-memory store with WRITE/EXTERNAL tools: idempotency, approvals "
+                        "and crash recovery are lost when the process exits")
+        self.recovered: list[str] = self.recover() if recover_on_start else []
+        if self.recovered:
+            log.warning("recovered %d action(s) left executing by a previous run; they are effect_unknown "
+                        "until reconciled", len(self.recovered))
+
+    def close(self) -> None:
+        """Release the store for another Runtime (the store itself stays open)."""
+        self.store.detach(self)
 
     def principal(self, principal_id: str) -> Principal | None:
         return self._principals.get(principal_id)
@@ -157,9 +177,10 @@ class Runtime:
             if not isinstance(value, str) or not 0 < len(value) <= MAX_ID_LEN or plain_json(value) is None:
                 raise MalformedProposal(f"{label} must be a non-empty UTF-8 string of at most {MAX_ID_LEN}"
                                         " characters")
-        key = call_key(run_id, call_id) if idempotency_key is None else idempotency_key
-        if not isinstance(key, str) or not key or plain_json(key) is None:
+        if idempotency_key is not None and (not isinstance(idempotency_key, str) or not idempotency_key
+                                            or plain_json(idempotency_key) is None):
             raise MalformedProposal("idempotency_key must be a non-empty UTF-8 string")
+        key = call_key(run_id, call_id) if idempotency_key is None else canonical_json({"key": idempotency_key})
         if deadline is not None and (isinstance(deadline, bool) or not isinstance(deadline, (int, float))
                                      or not math.isfinite(deadline)):
             raise ValueError("deadline must be a finite number (seconds since the epoch) or None")
@@ -211,7 +232,7 @@ class Runtime:
 
     @staticmethod
     def _build_action(spec: ToolSpec, model: BaseModel, *, key: str, actor: str, run_id: str,
-                      created_at: float, deadline: float | None) -> Action:
+                      created_at: float, deadline: float | None, salt: str | None = None) -> Action:
         frame = None
         if spec.frame is not None:
             declared = spec.frame(model)
@@ -221,7 +242,7 @@ class Runtime:
         return Action(action_id=action_id_for(key), idempotency_key=key, actor=actor, run_id=run_id,
                       tool=spec.name, tool_version=spec.version, schema_digest=spec.schema_digest,
                       args=model.model_dump(mode="json"), authority=spec.effect.value, frame=frame,
-                      created_at=created_at, deadline=deadline)
+                      created_at=created_at, deadline=deadline, salt=new_salt() if salt is None else salt)
 
     def _replay(self, row: CallRow, principal_id: str, rh: str) -> Outcome:
         if row.request_hash != rh or row.principal != principal_id:
@@ -238,34 +259,67 @@ class Runtime:
         return {"approver": approver, "action_digest": digest, "approved_at": at,
                 "kind": "policy" if approver == POLICY_APPROVER else "human"}
 
-    def approve(self, key: str, *, approver_id: str, action_digest: str) -> Outcome:
-        """Approve exactly the action whose digest the approver was shown."""
+    def _authenticate(self, credential: Any, action_digest: str | None) -> AuthContext | str:
+        """The authenticated context for ``credential``, or a refusal reason."""
+        if self.authenticator is None:
+            return "no authenticator is configured; approvals are disabled"
+        try:
+            ctx = self.authenticator.authenticate(credential)
+        except Exception as exc:  # a broken authenticator must never mean "authenticated"
+            return f"authenticator raised {type(exc).__name__}"
+        if not isinstance(ctx, AuthContext):
+            return "authentication failed"
+        if ctx.expires_at is not None and self.store.now() >= ctx.expires_at:
+            return "credential has expired"
+        if ctx.scope is not None and ctx.scope != action_digest:
+            return "credential is scoped to a different action"
+        return ctx
+
+    def _refuse(self, row: CallRow, reason: str, **data: Any) -> ApprovalRefused:
+        self.store.record(row.run_id, "approval.refused", {"reason": reason, **data}, call_key=row.key)
+        return ApprovalRefused(reason)
+
+    def approve(self, key: str, *, credential: Any, action_digest: str) -> Outcome:
+        """Approve exactly the action whose digest the approver was shown.
+
+        ``credential`` is authenticated by the operator's :class:`Authenticator`; the
+        resulting identity, not any string the caller supplies, is the approver.
+        """
         row = self._get(key)
-        refusal = self._approval_problem(row, approver_id)
+        ctx = self._authenticate(credential, row.action_digest)
+        if isinstance(ctx, str):
+            raise self._refuse(row, ctx, action_digest=action_digest)
+        refusal = self._approval_problem(row, ctx.subject)
         if refusal is None and action_digest != row.action_digest:
             refusal = "approval is for a different action"
         if refusal is not None:
-            self.store.record(row.run_id, "approval.refused",
-                              {"approver": approver_id, "reason": refusal, "action_digest": action_digest},
-                              call_key=key)
-            raise ApprovalRefused(refusal)
-        record = self._approval_record(approver_id, action_digest, self.store.now())
-        if not self.store.transition(key, "awaiting_approval", "approved", approval=record,
-                                     reason=f"approved by {approver_id}",
-                                     event={"approver": approver_id, "action_digest": action_digest}):
-            raise ApprovalRefused("action is no longer awaiting approval")
+            raise self._refuse(row, refusal, approver=ctx.subject, action_digest=action_digest)
+        record = {**self._approval_record(ctx.subject, action_digest, self.store.now()), "auth": ctx.record()}
+        try:
+            ok = self.store.transition(key, "awaiting_approval", "approved", approval=record,
+                                       reason=f"approved by {ctx.subject}", unexpired_at=self.store.now(),
+                                       consume_credential=ctx.record()["credential"],
+                                       event={"approver": ctx.subject, "action_digest": action_digest,
+                                              "approval_digest": approval_digest(record)})
+        except CredentialReused:
+            raise self._refuse(row, "this approval credential has already been used", approver=ctx.subject) from None
+        if not ok:
+            raise self._refuse(row, "action is no longer awaiting approval (or its window just elapsed)",
+                               approver=ctx.subject)
         return Outcome.of(self._get(key))
 
-    def reject(self, key: str, *, approver_id: str, reason: str = "") -> Outcome:
+    def reject(self, key: str, *, credential: Any, reason: str = "") -> Outcome:
         row = self._get(key)
-        refusal = self._approval_problem(row, approver_id)
+        ctx = self._authenticate(credential, row.action_digest)
+        if isinstance(ctx, str):
+            raise self._refuse(row, ctx)
+        refusal = self._approval_problem(row, ctx.subject)
         if refusal is not None:
-            self.store.record(row.run_id, "approval.refused", {"approver": approver_id, "reason": refusal},
-                              call_key=key)
-            raise ApprovalRefused(refusal)
+            raise self._refuse(row, refusal, approver=ctx.subject)
         if not self.store.transition(key, "awaiting_approval", "rejected", reason=reason or "rejected",
-                                     event={"approver": approver_id}):
-            raise ApprovalRefused("action is no longer awaiting approval")
+                                     consume_credential=ctx.record()["credential"],
+                                     event={"approver": ctx.subject}):
+            raise self._refuse(row, "action is no longer awaiting approval", approver=ctx.subject)
         return Outcome.of(self._get(key))
 
     def _approval_problem(self, row: CallRow, approver_id: str) -> str | None:
@@ -300,9 +354,16 @@ class Runtime:
             return Outcome.of(row)
         problem, spec, model, action = self._pre_execution_check(row)
         if problem is not None:
-            self.store.transition(key, "approved", "cancelled", reason=f"blocked at execution: {problem}")
+            self.store.transition(key, "approved", "cancelled", attempt=row.dispatches,
+                                  reason=f"blocked at execution: {problem}")
             return Outcome.of(self._get(key))
         assert spec is not None and model is not None and action is not None
+        stuck = [k for k, w in self._live.items() if w.is_alive()]
+        if len(stuck) >= self.max_stuck_workers:
+            # Timed-out tools that ignore cancellation still hold threads; don't pile up more.
+            self.store.record(row.run_id, "dispatch.throttled", {"live_workers": len(stuck)}, call_key=key)
+            log.warning("not dispatching %s: %d workers from earlier dispatches are still running", key, len(stuck))
+            return Outcome.of(row)
 
         before: Snapshot | None = None
         if spec.observer is not None:
@@ -315,7 +376,9 @@ class Runtime:
         attempt = row.dispatches + 1
         # The executing event is committed before the tool is invoked, so the audit log can
         # over-count invocations after a crash (see recover()) but can never under-count.
-        if not self.store.transition(key, "approved", "executing", dispatches=attempt,
+        # Fenced on the dispatch count read above, so an executor holding a stale row can't
+        # claim an action that was dispatched, reconciled and re-approved in the meantime.
+        if not self.store.transition(key, "approved", "executing", attempt=row.dispatches, dispatches=attempt,
                                      before=digests(before) if before is not None else None,
                                      event={"action_digest": row.action_digest, "attempt": attempt}):
             return Outcome.of(self._get(key))
@@ -329,7 +392,22 @@ class Runtime:
 
         def finish(state: str, **fields: Any) -> None:
             try:
-                if not self.store.transition(key, "executing", state, attempt=attempt, **fields):
+                try:
+                    ok = self.store.transition(key, "executing", state, attempt=attempt, **fields)
+                except Exception as exc:
+                    # The result (or its frame report) could not be stored. Don't leave the action
+                    # wedged in executing: record the honest fallback instead.
+                    log.warning("could not record %s for %s (%s); recording the fallback", state, key,
+                                type(exc).__name__)
+                    fallback = "effect_unknown" if effectful else "failed"
+                    ok = self.store.transition(key, "executing", fallback, attempt=attempt,
+                                               reason=f"result could not be recorded ({type(exc).__name__})")
+                if ok:
+                    self._before.pop(key, None)
+                    if state == "effect_unknown":
+                        log.warning("action %s: effect unknown (%s)", key, fields.get("reason", ""))
+                else:
+                    log.warning("discarding a late result for %s (attempt %d)", key, attempt)
                     self.store.record(row.run_id, "call.late_result_discarded", {"would_have_been": state},
                                       call_key=key)
             except Exception:  # e.g. the store was closed while a timed-out tool kept running
@@ -355,23 +433,74 @@ class Runtime:
             finish("succeeded", result=out, result_digest=sha256_text(canonical_json(out)), reason="",
                    frame_result=self._frame_result(spec, action, key, attempt))
 
+        if spec.isolation == "process":
+            self._dispatch_in_process(spec, model, action, key, attempt, effectful, finish)
+            return Outcome.of(self._get(key))
+
         worker = threading.Thread(target=work, name=f"sar-tool-{spec.name}", daemon=True)
         self._live[key] = worker
         worker.start()
         worker.join(spec.timeout_s)
         if worker.is_alive():
             ctx.cancel.set()
-            self.store.transition(key, "executing", "effect_unknown" if effectful else "failed",
-                                  attempt=attempt, reason=f"no result within {spec.timeout_s}s")
+            if self.store.transition(key, "executing", "effect_unknown" if effectful else "failed",
+                                     attempt=attempt, reason=f"no result within {spec.timeout_s}s"):
+                log.warning("action %s timed out; the worker thread cannot be killed and may still act", key)
+        else:
+            self._live.pop(key, None)
         return Outcome.of(self._get(key))
+
+    def _dispatch_in_process(self, spec: ToolSpec, model: BaseModel, action: Action, key: str, attempt: int,
+                             effectful: bool, finish: Callable[..., None]) -> None:
+        """Run one attempt in a fresh worker process; kill it on timeout.
+
+        Killing the worker proves nothing about the external effect, so a timeout of an
+        effectful tool is ``effect_unknown`` exactly as in thread mode. The worker never
+        writes to the store; its single message is tagged with action id and attempt,
+        and the outcome is recorded here, fenced by attempt.
+        """
+        from .isolation import Worker
+
+        token = f"{action.action_id}#{attempt}"
+        worker = Worker(token, spec.fn, spec.input_model, canonical_json(model.model_dump(mode="json")),
+                        {"action_id": action.action_id, "idempotency_key": key, "attempt": attempt},
+                        spec.takes_ctx)
+        self._live[key] = worker
+        self._faults("after_spawn", key)
+        res = worker.wait(spec.timeout_s)
+        self._live.pop(key, None)
+        self._faults("after_effect", key)
+        unknown = "effect_unknown" if effectful else "failed"
+        if res.kind == "ok":
+            try:
+                raw = json.loads(res.payload)
+            except ValueError:
+                raw = None
+            out, error = validate_output(spec, raw)
+            if out is None:
+                finish(unknown if effectful else "output_rejected", reason=f"invalid output: {error}")
+            else:
+                finish("succeeded", result=out, result_digest=sha256_text(canonical_json(out)), reason="",
+                       frame_result=self._frame_result(spec, action, key, attempt))
+        elif res.kind == "not_applied":
+            finish("failed", reason="tool reported its effect was not applied")
+        elif res.kind == "raised":
+            finish(unknown, reason=f"tool raised {res.payload}")
+        elif res.kind == "bad_output":
+            finish(unknown if effectful else "output_rejected", reason="invalid output: not plain JSON")
+        elif res.kind == "timeout":
+            finish(unknown, reason=f"no result within {spec.timeout_s}s; worker killed")
+        elif res.kind == "wrong_token":
+            self.store.record(action.run_id, "worker.message_rejected", {"attempt": attempt}, call_key=key)
+            finish(unknown, reason="worker sent a message for a different attempt")
+        else:  # died
+            finish(unknown, reason=f"worker process died ({res.payload})")
 
     def _frame_result(self, spec: ToolSpec, action: Action, key: str, attempt: int) -> dict[str, Any] | None:
         if spec.observer is None or action.frame is None:
             return None
         cached = self._before.get(key)
-        before = None
-        if cached is not None and cached[0] == attempt:
-            before = self._before.pop(key)[1]
+        before = cached[1] if cached is not None and cached[0] == attempt else None
         if before is None:
             row = self.store.get_call(key)
             if row is None or row.before is None:
@@ -399,6 +528,11 @@ class Runtime:
             return ("stored action does not match its digest", *none)
         if not row.approval or row.approval.get("action_digest") != row.action_digest:
             return ("approval does not match the stored action", *none)
+        if not self._approval_is_audited(row):
+            return ("approval record is not backed by the audit log", *none)
+        if (row.approval.get("kind") == "human"
+                and self.store.now() >= float(row.approval.get("approved_at", 0)) + self.approval_ttl_s):
+            return ("approval expired before dispatch", *none)
         if stored.deadline is not None and self.store.now() >= stored.deadline:
             return ("action deadline has passed", *none)
         model, _ = parse_input(spec, stored.args)  # the tool's schema may have changed since
@@ -406,7 +540,8 @@ class Runtime:
             return ("stored arguments no longer validate", *none)
         try:
             current = self._build_action(spec, model, key=row.key, actor=stored.actor, run_id=stored.run_id,
-                                         created_at=stored.created_at, deadline=stored.deadline)
+                                         created_at=stored.created_at, deadline=stored.deadline,
+                                         salt=stored.salt)
         except Exception as exc:
             return (f"could not declare effects: {type(exc).__name__}", *none)
         if current.digest != row.action_digest:
@@ -421,6 +556,14 @@ class Runtime:
             if refusal is not None:
                 return (f"approval no longer valid: {refusal}", *none)
         return None, spec, model, current
+
+    def _approval_is_audited(self, row: CallRow) -> bool:
+        """The latest ``call.approved`` event must carry this exact approval record's digest."""
+        latest = None
+        for e in self.store.events(call_key=row.key, kind="call.approved"):
+            latest = e
+        return (latest is not None and row.approval is not None
+                and latest.data.get("approval_digest") == approval_digest(row.approval))
 
     # -- uncertain outcomes ------------------------------------------------------- #
     def reconcile(self, key: str) -> Outcome:
@@ -454,6 +597,7 @@ class Runtime:
         ctx = ToolContext(action_id=action.action_id, idempotency_key=key, attempt=attempt,
                           cancel=threading.Event())
         finding = _bounded(lambda: reconciler(model, ctx), spec.timeout_s)
+        self._faults("after_reconcile", key)
         if isinstance(finding, Applied):
             out, error = validate_output(spec, finding.result)
             if out is None:
@@ -465,30 +609,42 @@ class Runtime:
                                          frame_result=self._frame_result(spec, action, key, attempt),
                                          event={"reconciled": "applied", "attempt": attempt}):
                 self.store.record(row.run_id, "reconcile.stale", {"attempt": attempt}, call_key=key)
+            else:
+                self._before.pop(key, None)
+                log.info("action %s reconciled: applied", key)
         elif isinstance(finding, NotApplied):
             if not self.store.transition(key, "effect_unknown", "approved", attempt=attempt,
                                          reason="reconciled: effect not applied; may be dispatched again",
-                                         event={"reconciled": "not_applied", "attempt": attempt}):
+                                         event={"reconciled": "not_applied", "attempt": attempt,
+                                                "approval_digest": approval_digest(row.approval or {})}):
                 self.store.record(row.run_id, "reconcile.stale", {"attempt": attempt}, call_key=key)
+            else:
+                self._before.pop(key, None)
+                log.info("action %s reconciled: not applied; it may be dispatched again", key)
         else:
             why = finding.reason if isinstance(finding, Unknown) else f"reconciler returned {type(finding).__name__}"
             self.store.record(row.run_id, "reconcile.unknown", {"why": (why or "undecided")[:200]}, call_key=key)
         return Outcome.of(self._get(key))
 
-    def resolve(self, key: str, *, by: str, applied: bool, result: Any = None,
+    def resolve(self, key: str, *, credential: Any, applied: bool, result: Any = None,
                 redispatch: bool = False) -> Outcome:
         """A human's verdict on an ``effect_unknown`` action, for tools with no reconciler.
 
-        ``by`` must be an approver other than the requester. ``applied=False`` ends the
-        action as ``failed`` unless ``redispatch=True``, which re-approves it.
+        The authenticated subject of ``credential`` must be an approver other than the
+        requester. ``applied=False`` ends the action as ``failed`` unless
+        ``redispatch=True``, which re-approves it in the resolver's name.
         """
         row = self._get(key)
         if row.state != "effect_unknown":
-            raise ApprovalRefused(f"action is {row.state}, not effect_unknown")
-        refusal = approval_refusal(self._principals.get(by), row.principal)
+            hint = " (if the runtime crashed, recover() moves it to effect_unknown)" if row.state == "executing" else ""
+            raise ApprovalRefused(f"action is {row.state}, not effect_unknown{hint}")
+        ctx = self._authenticate(credential, row.action_digest)
+        refusal = ctx if isinstance(ctx, str) else approval_refusal(self._principals.get(ctx.subject), row.principal)
         if refusal is not None:
-            self.store.record(row.run_id, "resolve.refused", {"by": by, "reason": refusal}, call_key=key)
+            self.store.record(row.run_id, "resolve.refused", {"reason": refusal}, call_key=key)
             raise ApprovalRefused(refusal)
+        assert isinstance(ctx, AuthContext)
+        by = ctx.subject
         worker = self._live.get(key)
         if worker is not None and worker.is_alive():
             raise ApprovalRefused("the last dispatch is still running; resolve after it finishes")
@@ -503,17 +659,37 @@ class Runtime:
             frame = None
             if spec is not None and row.action is not None:
                 frame = self._frame_result(spec, Action.from_body(row.action), key, attempt)
-            ok = self.store.transition(key, "effect_unknown", "succeeded", attempt=attempt, result=out,
-                                       result_digest=sha256_text(canonical_json(out)) if out is not None else None,
-                                       reason=f"resolved by {by}: effect was applied", frame_result=frame,
-                                       event={"resolved_by": by, "applied": True, "attempt": attempt})
+            try:
+                ok = self.store.transition(
+                    key, "effect_unknown", "succeeded", attempt=attempt, result=out,
+                    result_digest=sha256_text(canonical_json(out)) if out is not None else None,
+                    reason=f"resolved by {by}: effect was applied", frame_result=frame,
+                    consume_credential=ctx.record()["credential"],
+                    event={"resolved_by": by, "applied": True, "attempt": attempt})
+            except CredentialReused:
+                raise ApprovalRefused("this approval credential has already been used") from None
+        elif redispatch:
+            record = {**self._approval_record(by, row.action_digest, self.store.now()), "auth": ctx.record()}
+            try:
+                ok = self.store.transition(
+                    key, "effect_unknown", "approved", attempt=attempt, approval=record,
+                    reason=f"resolved by {by}: effect not applied; re-approved",
+                    consume_credential=ctx.record()["credential"],
+                    event={"resolved_by": by, "applied": False, "redispatch": True, "attempt": attempt,
+                           "approval_digest": approval_digest(record)})
+            except CredentialReused:
+                raise ApprovalRefused("this approval credential has already been used") from None
         else:
-            ok = self.store.transition(key, "effect_unknown", "approved" if redispatch else "failed",
-                                       attempt=attempt, reason=f"resolved by {by}: effect not applied",
-                                       event={"resolved_by": by, "applied": False, "redispatch": redispatch,
-                                              "attempt": attempt})
+            try:
+                ok = self.store.transition(key, "effect_unknown", "failed", attempt=attempt,
+                                           reason=f"resolved by {by}: effect not applied",
+                                           consume_credential=ctx.record()["credential"],
+                                           event={"resolved_by": by, "applied": False, "attempt": attempt})
+            except CredentialReused:
+                raise ApprovalRefused("this approval credential has already been used") from None
         if not ok:
             raise ApprovalRefused("the action changed while it was being resolved")
+        self._before.pop(key, None)
         return Outcome.of(self._get(key))
 
     # -- recovery ----------------------------------------------------------------- #
@@ -521,7 +697,8 @@ class Runtime:
         """After a crash: actions left ``executing`` become ``effect_unknown`` (or ``failed``
         for READ tools, which have no effect). Nothing is re-dispatched automatically.
 
-        Call this only at startup, before any worker of this store is running.
+        Runs automatically when a Runtime is constructed (``recover_on_start``). Call it by
+        hand only when no worker of this store is running.
         """
         moved = []
         for row in self.store.calls(state="executing"):
@@ -531,11 +708,12 @@ class Runtime:
         return moved
 
     # -- receipts ----------------------------------------------------------------- #
-    def receipt(self, key: str, *, signing_key: bytes | None = None, key_id: str = "default") -> dict[str, Any]:
+    def receipt(self, key: str, *, signer: Any = None, signing_key: bytes | None = None,
+                key_id: str = "default") -> dict[str, Any]:
         """A machine-verifiable Agent Receipt for one action (see ``receipts``)."""
         from .receipts import build_receipt
 
-        return build_receipt(self.store, key, signing_key=signing_key, key_id=key_id)
+        return build_receipt(self.store, key, signer=signer, signing_key=signing_key, key_id=key_id)
 
     def _get(self, key: str) -> CallRow:
         row = self.store.get_call(key)

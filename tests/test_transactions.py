@@ -16,7 +16,7 @@ from secure_agent_runtime.examples import refund as rf
 from secure_agent_runtime.runtime import ApprovalRefused, ReplayDivergence
 from secure_agent_runtime.store import Store
 
-from .conftest import execution_events
+from .conftest import cred, execution_events
 
 ARGS = {"order": 821, "amount_inr": 4500}
 
@@ -34,7 +34,7 @@ def rrt(service, store):
 def approved(rt, args=ARGS, call_id="call_1", **kw):
     o = rt.propose(run_id="t", principal_id=rf.AGENT, call_id=call_id, tool="refund", arguments=args, **kw)
     assert o.state == "awaiting_approval"
-    return rt.approve(o.key, approver_id=rf.APPROVER, action_digest=o.action_digest)
+    return rt.approve(o.key, credential=cred(rt, rf.APPROVER), action_digest=o.action_digest)
 
 
 def wait_for(cond, timeout=5.0):
@@ -92,7 +92,7 @@ def test_request_lost_before_effect_is_redispatched_once_after_reconciliation(rr
 
 
 def test_definite_failure_is_failed_not_unknown(service, store):
-    rt = rf.build_runtime(service, store)
+    rt = rf.build_runtime(service, store, isolation="thread")
 
     def refuse(*a, **k):
         raise EffectNotApplied("card declined")
@@ -108,7 +108,7 @@ def test_definite_failure_is_failed_not_unknown(service, store):
 
 def _slow_refund_runtime(service, store, *, apply_first: bool):
     """A refund tool that outlives its 50 ms timeout, either before or after moving money."""
-    rt = rf.build_runtime(service, store)
+    rt = rf.build_runtime(service, store, isolation="thread")
     spec = rt.registry.get("refund")
     done = threading.Event()
 
@@ -172,8 +172,8 @@ def test_crash_after_claim_before_dispatch(tmp_path, service, clock):
     assert rt.store.get_call(o.key).state == "executing" and service.calls == 0
     rt.store.close()
 
-    rt2 = rf.build_runtime(service, Store(db, now=clock))  # restart
-    assert rt2.recover() == [o.key]
+    rt2 = rf.build_runtime(service, Store(db, now=clock))  # restart: recovers automatically
+    assert rt2.recovered == [o.key]
     assert rt2.execute(o.key).state == "effect_unknown" and service.calls == 0  # not blindly re-run
     assert rt2.reconcile(o.key).state == "approved"
     assert rt2.execute(o.key).state == "succeeded"
@@ -186,14 +186,14 @@ def test_crash_after_claim_before_dispatch(tmp_path, service, clock):
 
 def test_crash_after_effect_before_recording(tmp_path, service, clock):
     db = str(tmp_path / "sar.db")
-    rt = rf.build_runtime(service, Store(db, now=clock), faults=Crash("after_effect"))
+    rt = rf.build_runtime(service, Store(db, now=clock), faults=Crash("after_effect"), isolation="thread")
     o = approved(rt)
     assert rt.execute(o.key).state == "executing"  # the worker died after the refund
     assert len(service.refunds) == 1
     rt.store.close()
 
     rt2 = rf.build_runtime(service, Store(db, now=clock))
-    assert rt2.recover() == [o.key]
+    assert rt2.recovered == [o.key]
     retry = rt2.propose(run_id="t", principal_id=rf.AGENT, call_id="call_1", tool="refund", arguments=ARGS)
     assert rt2.execute(retry.key).state == "effect_unknown"
     out = rt2.reconcile(o.key)
@@ -217,7 +217,7 @@ def test_crash_during_read_recovers_to_failed(rt, app):
 
 @pytest.mark.parametrize("behaviour", ["unknown", "raises", "hangs", "garbage", "bad_result"])
 def test_undecided_reconciliation_keeps_the_action_unknown(service, store, behaviour):
-    rt = rf.build_runtime(service, store)
+    rt = rf.build_runtime(service, store, isolation="thread")
     import dataclasses
 
     def recon(args, ctx):
@@ -249,18 +249,19 @@ def test_tool_without_reconciler_needs_a_human_resolution(rt, app):
 
     o = rt.propose(run_id="r", principal_id=AGENT, call_id="w", tool="write_note",
                    arguments={"title": "t", "body": "b"})
-    rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest)
+    rt.approve(o.key, credential=cred(rt, APPROVER), action_digest=o.action_digest)
     app.write = lambda args: (_ for _ in ()).throw(ConnectionError("lost"))
     assert rt.execute(o.key).state == "effect_unknown"
     assert rt.reconcile(o.key).state == "effect_unknown"
     assert rt.store.events(kind="reconcile.unavailable")
     with pytest.raises(ApprovalRefused):
-        rt.resolve(o.key, by=AGENT, applied=False, redispatch=True)  # the agent can't vouch for itself
+        # the agent can't vouch for itself
+        rt.resolve(o.key, credential=cred(rt, AGENT), applied=False, redispatch=True)
     del app.write
-    assert rt.resolve(o.key, by=APPROVER, applied=False, redispatch=True).state == "approved"
+    assert rt.resolve(o.key, credential=cred(rt, APPROVER), applied=False, redispatch=True).state == "approved"
     assert rt.execute(o.key).state == "succeeded" and app.notes["t"] == "b"
     with pytest.raises(ApprovalRefused):
-        rt.resolve(o.key, by=APPROVER, applied=True)
+        rt.resolve(o.key, credential=cred(rt, APPROVER), applied=True)
 
 
 def test_human_resolution_as_applied_and_as_abandoned(rt, app):
@@ -269,11 +270,11 @@ def test_human_resolution_as_applied_and_as_abandoned(rt, app):
     for cid, applied in (("a", True), ("b", False)):
         o = rt.propose(run_id="r", principal_id=AGENT, call_id=cid, tool="write_note",
                        arguments={"title": cid, "body": "x"})
-        rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest)
+        rt.approve(o.key, credential=cred(rt, APPROVER), action_digest=o.action_digest)
         rt.store.transition(o.key, "approved", "executing")
         rt.recover()
         result = {"title": cid, "created": True} if applied else None
-        out = rt.resolve(o.key, by=APPROVER, applied=applied, result=result)
+        out = rt.resolve(o.key, credential=cred(rt, APPROVER), applied=applied, result=result)
         assert out.state == ("succeeded" if applied else "failed")
         assert rt.execute(o.key).state == out.state
     assert app.invocations["write_note"] == 0
@@ -286,7 +287,7 @@ def test_stale_reconciliation_cannot_reopen_a_later_attempt(service, store):
     flip the action back to approved (which would allow attempt 3 unreconciled)."""
     import dataclasses
 
-    rt = rf.build_runtime(service, store)
+    rt = rf.build_runtime(service, store, isolation="thread")
     gate, entered = threading.Event(), threading.Event()
     spec = rt.registry.get("refund")
 
@@ -304,7 +305,7 @@ def test_stale_reconciliation_cannot_reopen_a_later_attempt(service, store):
     t = threading.Thread(target=lambda: result.setdefault("r", rt.reconcile(o.key)))
     t.start()
     assert entered.wait(5)
-    rt.resolve(o.key, by=rf.APPROVER, applied=False, redispatch=True)   # a human decides first
+    rt.resolve(o.key, credential=cred(rt, rf.APPROVER), applied=False, redispatch=True)   # a human decides first
     service.fail_next = "after_effect"
     assert rt.execute(o.key).state == "effect_unknown"                  # attempt 2: money moved
     gate.set()
@@ -317,7 +318,7 @@ def test_stale_reconciliation_cannot_reopen_a_later_attempt(service, store):
 def test_late_worker_of_attempt_one_cannot_complete_attempt_two(service, store):
     import dataclasses
 
-    rt = rf.build_runtime(service, store)
+    rt = rf.build_runtime(service, store, isolation="thread")
     release1, release2, done1 = threading.Event(), threading.Event(), threading.Event()
     spec = rt.registry.get("refund")
 
@@ -335,7 +336,7 @@ def test_late_worker_of_attempt_one_cannot_complete_attempt_two(service, store):
     assert rt.execute(o.key).state == "effect_unknown"
     release1.set()
     assert done1.wait(5) and wait_for(lambda: store.events(kind="call.late_result_discarded"))
-    rt.resolve(o.key, by=rf.APPROVER, applied=False, redispatch=True)
+    rt.resolve(o.key, credential=cred(rt, rf.APPROVER), applied=False, redispatch=True)
     rt.registry.replace(dataclasses.replace(spec, fn=tool, timeout_s=5))
     t = threading.Thread(target=rt.execute, args=(o.key,))
     t.start()
@@ -350,7 +351,7 @@ def test_late_worker_of_attempt_one_cannot_complete_attempt_two(service, store):
 def test_late_worker_finishing_mid_attempt_two_is_discarded(service, store):
     import dataclasses
 
-    rt = rf.build_runtime(service, store)
+    rt = rf.build_runtime(service, store, isolation="thread")
     release1, entered2, release2 = threading.Event(), threading.Event(), threading.Event()
     spec = rt.registry.get("refund")
 
@@ -372,7 +373,7 @@ def test_late_worker_finishing_mid_attempt_two_is_discarded(service, store):
     assert rt.reconcile(o.key).state == "effect_unknown"  # deferred: attempt 1 still running
     assert store.events(kind="reconcile.deferred")
     with pytest.raises(ApprovalRefused, match="still running"):
-        rt.resolve(o.key, by=rf.APPROVER, applied=False, redispatch=True)
+        rt.resolve(o.key, credential=cred(rt, rf.APPROVER), applied=False, redispatch=True)
     release1.set()
     assert wait_for(lambda: store.events(kind="call.late_result_discarded"))
 
@@ -437,7 +438,7 @@ def test_approval_for_1000_does_not_authorise_10000(rrt, service):
                       arguments={"order": 821, "amount_inr": 10000})
     assert big.state == "awaiting_approval"
     with pytest.raises(ApprovalRefused, match="different action"):
-        rrt.approve(big.key, approver_id=rf.APPROVER, action_digest=small.action_digest)
+        rrt.approve(big.key, credential=cred(rrt, rf.APPROVER), action_digest=small.action_digest)
     assert rrt.execute(big.key).state == "awaiting_approval"
     rrt.execute(small.key)
     assert service.total_refunded(821) == 1000
@@ -448,7 +449,7 @@ def test_an_approval_cannot_be_reused_for_an_identical_second_action(rrt, servic
     second = rrt.propose(run_id="t", principal_id=rf.AGENT, call_id="b", tool="refund", arguments=ARGS)
     assert second.action_digest != first.action_digest  # same content, different action
     with pytest.raises(ApprovalRefused):
-        rrt.approve(second.key, approver_id=rf.APPROVER, action_digest=first.action_digest)
+        rrt.approve(second.key, credential=cred(rrt, rf.APPROVER), action_digest=first.action_digest)
 
 
 def test_tool_upgrade_after_approval_blocks_dispatch(rrt, service):
@@ -478,7 +479,7 @@ def test_human_resolution_still_checks_the_frame(rrt, service):
     o = approved(rrt)
     service.fail_next = "after_effect"
     rrt.execute(o.key)
-    out = rrt.resolve(o.key, by=rf.APPROVER, applied=True,
+    out = rrt.resolve(o.key, credential=cred(rrt, rf.APPROVER), applied=True,
                       result={"refund_id": "rf_0001", "order": 821, "amount_inr": 4500})
     assert out.state == "succeeded" and out.verification == "verified"
     assert rrt.receipt(o.key)["outcome"] == "verified"
@@ -501,7 +502,7 @@ def test_expired_approval_window(rrt, service, clock):
     o = rrt.propose(run_id="t", principal_id=rf.AGENT, call_id="c", tool="refund", arguments=ARGS)
     clock.advance(3601)
     with pytest.raises(ApprovalRefused, match="window"):
-        rrt.approve(o.key, approver_id=rf.APPROVER, action_digest=o.action_digest)
+        rrt.approve(o.key, credential=cred(rrt, rf.APPROVER), action_digest=o.action_digest)
     assert rrt.execute(o.key).state == "expired" and service.calls == 0
 
 
@@ -525,13 +526,13 @@ def test_agent_reconciles_a_lost_response_instead_of_refunding_twice(service, st
     from secure_agent_runtime.agent import Agent
     from secure_agent_runtime.examples.notes import ScriptedModel
 
-    rt = rf.build_runtime(service, store)
+    rt = rf.build_runtime(service, store, isolation="thread")
     model = ScriptedModel([{"tool_calls": [{"id": "c1", "name": "refund", "arguments": ARGS}]},
                            {"text": "Refunded."}])
     agent = Agent(rt, model, rf.AGENT)
     res = agent.start("ticket", "refund my order")
     row = store.get_call(res.pending[0])
-    rt.approve(row.key, approver_id=rf.APPROVER, action_digest=row.action_digest)
+    rt.approve(row.key, credential=cred(rt, rf.APPROVER), action_digest=row.action_digest)
     service.fail_next = "after_effect"
     done = agent.resume("ticket")
     assert done.status == "completed" and [o.state for o in done.outcomes] == ["succeeded"]

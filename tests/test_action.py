@@ -9,6 +9,8 @@ import pytest
 from secure_agent_runtime.action import Action
 from secure_agent_runtime.examples.notes import AGENT, APPROVER
 
+from .conftest import cred
+
 
 def prop(rt, call_id="c", args=None, tool="write_note", run_id="r", **kw):
     return rt.propose(run_id=run_id, principal_id=AGENT, call_id=call_id, tool=tool,
@@ -26,8 +28,21 @@ def test_reordered_arguments_give_the_same_args_digest(rt):
     b = rt.propose(run_id="r", principal_id=AGENT, call_id="c2", tool="write_note",
                    arguments={"body": "b", "title": "t"})
     ra, rb = rt.store.get_call(a.key), rt.store.get_call(b.key)
-    assert ra.action["args_digest"] == rb.action["args_digest"]
     assert ra.action["args"] == rb.action["args"] == {"body": "b", "title": "t"}
+    # Digests are salted per action; with the same salt, order makes no difference.
+    from secure_agent_runtime.action import args_digest
+    assert args_digest(ra.action["args"], "s") == args_digest({"title": "t", "body": "b"}, "s")
+    assert ra.action["args_digest"] == args_digest(ra.action["args"], ra.action["salt"])
+
+
+def test_args_digest_is_salted_so_low_entropy_args_cannot_be_guessed(rt):
+    """B4d: an unsalted SHA-256 of {"amount": 4242} is reversible by enumeration."""
+    from secure_agent_runtime.action import args_digest
+    o = prop(rt, "c1", {"title": "t", "body": "4242"})
+    public = rt.receipt(o.key)["action"]
+    assert "salt" not in public and "args" not in public
+    guesses = {args_digest({"body": str(n), "title": "t"}) for n in range(10_000)}
+    assert public["args_digest"] not in guesses
 
 
 def test_identical_proposals_under_one_key_are_one_action(rt):
@@ -67,7 +82,7 @@ def test_digest_covers_every_envelope_field(rt):
     changes = {"action_id": "act_" + "0" * 24, "idempotency_key": "other", "actor": APPROVER, "run_id": "r2",
                "tool": "read_note", "tool_version": "2", "schema_digest": "sha256:" + "0" * 64,
                "args": {"title": "t", "body": "B"}, "authority": "external", "frame": {"required": []},
-               "created_at": a.created_at + 1, "deadline": 1e10}
+               "created_at": a.created_at + 1, "deadline": 1e10, "salt": "00" * 16}
     assert set(changes) == {f.name for f in dataclasses.fields(Action)}  # nothing left uncovered
     for field, value in changes.items():
         assert dataclasses.replace(a, **{field: value}).digest != a.digest, field
@@ -77,7 +92,7 @@ def test_output_schema_change_after_approval_blocks_dispatch(rt, app):
     from pydantic import BaseModel, ConfigDict
 
     o = prop(rt)
-    rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest)
+    rt.approve(o.key, credential=cred(rt, APPROVER), action_digest=o.action_digest)
 
     class WriteOutV2(BaseModel):
         model_config = ConfigDict(extra="forbid")

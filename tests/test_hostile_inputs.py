@@ -11,12 +11,13 @@ import pytest
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from secure_agent_runtime.agent import Agent
+from secure_agent_runtime.auth import TokenAuthenticator
 from secure_agent_runtime.contracts import MAX_JSON_BYTES, Effect, ToolRegistry
 from secure_agent_runtime.examples.notes import AGENT, APPROVER, ScriptedModel, build_runtime
 from secure_agent_runtime.policy import Policy, Principal
 from secure_agent_runtime.runtime import MalformedProposal, Runtime
 
-from .conftest import execution_events
+from .conftest import cred, execution_events
 
 # Deep enough to exceed every supported Python's JSON recursion limit (3.12's C encoder
 # accepts 5000 levels, 3.10/3.11 do not).
@@ -94,7 +95,7 @@ def _single_tool_runtime(store, fn, output=None, timeout_s=2.0, effect=Effect.RE
 
     reg = ToolRegistry()
     reg.tool(name="t", input=In, output=output or Out, effect=effect, timeout_s=timeout_s)(fn)
-    return Runtime(registry=reg, policy=Policy(), store=store,
+    return Runtime(authenticator=TokenAuthenticator(), registry=reg, policy=Policy(), store=store,
                    principals=[Principal("p", grants=frozenset({"t"})),
                                Principal(APPROVER, can_approve=True)])
 
@@ -162,7 +163,7 @@ def test_unstable_input_validator_is_refused_before_hashing(store):
         seen.append(args.v)
         return Out()
 
-    rt = Runtime(registry=reg, policy=Policy(), store=store,
+    rt = Runtime(authenticator=TokenAuthenticator(), registry=reg, policy=Policy(), store=store,
                  principals=[Principal("p", grants=frozenset({"t"}))])
     o = rt.propose(run_id="r", principal_id="p", call_id="c", tool="t", arguments={"v": "x"})
     assert o.state == "invalid" and "round-trip" in o.reason
@@ -192,12 +193,12 @@ def test_tool_receives_exactly_the_approved_arguments(store):
         seen.append(args.model_dump())
         return Out()
 
-    rt = Runtime(registry=reg, policy=Policy(), store=store,
+    rt = Runtime(authenticator=TokenAuthenticator(), registry=reg, policy=Policy(), store=store,
                  principals=[Principal("p", grants=frozenset({"t"})), Principal(APPROVER, can_approve=True)])
     o = rt.propose(run_id="r", principal_id="p", call_id="c", tool="t", arguments={"v": "HeLLo"})
     row = store.get_call(o.key)
     assert row.args == {"v": "hello"}
-    rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest)
+    rt.approve(o.key, credential=cred(rt, APPROVER), action_digest=o.action_digest)
     assert rt.execute(o.key).state == "succeeded" and seen == [row.args]
 
 
@@ -209,7 +210,7 @@ def test_schema_default_added_after_approval_blocks_execution(rt, app):
 
     o = rt.propose(run_id="r", principal_id=AGENT, call_id="c", tool="write_note",
                    arguments={"title": "todo", "body": "b"})
-    rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest)
+    rt.approve(o.key, credential=cred(rt, APPROVER), action_digest=o.action_digest)
 
     class WriteV2(BaseModel):
         model_config = ConfigDict(extra="forbid")
@@ -244,7 +245,8 @@ def test_late_result_after_store_close_does_not_raise_in_worker(clock, caplog):
         release.set()
         assert done.wait(5)
         deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and not caplog.records:
+        while time.monotonic() < deadline and not any(
+                "could not record the result" in r.getMessage() for r in caplog.records):
             time.sleep(0.005)
     finally:
         threading.excepthook = old_hook
@@ -270,10 +272,12 @@ def test_failed_commit_rolls_back_and_store_stays_usable(rt, app):
             return real.execute(sql, *a)
 
     rt.store._db = FailingCommit()
-    with pytest.raises(sqlite3.OperationalError):
-        rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest)
+    from secure_agent_runtime.errors import StoreError
+
+    with pytest.raises(StoreError):
+        rt.approve(o.key, credential=cred(rt, APPROVER), action_digest=o.action_digest)
     assert rt.store.get_call(o.key).state == "awaiting_approval"  # rolled back
-    assert rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest).state == "approved"
+    assert rt.approve(o.key, credential=cred(rt, APPROVER), action_digest=o.action_digest).state == "approved"
     assert rt.store.verify_audit()[0]
     assert rt.execute(o.key).state == "succeeded" and execution_events(rt.store) == 1
 

@@ -20,6 +20,8 @@ from secure_agent_runtime.effects import (
 from secure_agent_runtime.examples import version_bump as vb
 from secure_agent_runtime.store import Store
 
+from .conftest import cred
+
 # -- globs ---------------------------------------------------------------------------------- #
 
 @pytest.mark.parametrize("pattern,path,match", [
@@ -218,7 +220,7 @@ def test_declared_frame_is_part_of_what_was_approved(tmp_path):
     rt = vb.build_runtime(vb.make_workspace(tmp_path), vb.careful_agent)
     o = rt.propose(run_id="r", principal_id=vb.AGENT, call_id="c", tool="bump_version",
                    arguments={"from_version": "2.1.0", "to_version": "2.1.1"})
-    rt.approve(o.key, approver_id=vb.APPROVER, action_digest=o.action_digest)
+    rt.approve(o.key, credential=cred(rt, vb.APPROVER), action_digest=o.action_digest)
     spec = rt.registry.get("bump_version")
     loosened = dataclasses.replace(spec, frame=lambda a: FrameSpec(allowed=("**",)))
     rt.registry.replace(loosened)
@@ -247,7 +249,7 @@ def test_observer_failure_before_dispatch_blocks_the_tool(tmp_path):
     rt.registry.replace(dataclasses.replace(rt.registry.get("bump_version"), observer=Broken()))
     o = rt.propose(run_id="r", principal_id=vb.AGENT, call_id="c", tool="bump_version",
                    arguments={"from_version": "2.1.0", "to_version": "2.1.1"})
-    rt.approve(o.key, approver_id=vb.APPROVER, action_digest=o.action_digest)
+    rt.approve(o.key, credential=cred(rt, vb.APPROVER), action_digest=o.action_digest)
     out = rt.execute(o.key)
     assert out.state == "cancelled" and "could not observe" in out.reason and calls == []
 
@@ -264,7 +266,7 @@ def test_restart_loses_before_content_so_content_checks_are_unverifiable(tmp_pat
     rt._faults = crash
     o = rt.propose(run_id="r", principal_id=vb.AGENT, call_id="c", tool="bump_version",
                    arguments={"from_version": "2.1.0", "to_version": "2.1.1"})
-    rt.approve(o.key, approver_id=vb.APPROVER, action_digest=o.action_digest)
+    rt.approve(o.key, credential=cred(rt, vb.APPROVER), action_digest=o.action_digest)
     assert rt.execute(o.key).state == "executing"
     rt.store.close()
 

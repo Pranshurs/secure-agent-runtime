@@ -14,7 +14,8 @@ run, the idempotency key, the declared frame or the deadline changes the digest.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+import secrets
+from dataclasses import dataclass, field
 from typing import Any
 
 from .contracts import canonical_json
@@ -26,8 +27,14 @@ def sha256_text(text: str) -> str:
     return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def args_digest(args: dict[str, Any]) -> str:
-    return sha256_text(canonical_json(args))
+def args_digest(args: dict[str, Any], salt: str = "") -> str:
+    """Salted, so a receipt's digest of low-entropy arguments (an amount, a short id) can't
+    be reversed by trying every value. Whoever holds the stored action can recompute it."""
+    return sha256_text(salt + canonical_json(args))
+
+
+def new_salt() -> str:
+    return secrets.token_hex(16)
 
 
 def action_id_for(idempotency_key: str) -> str:
@@ -49,10 +56,11 @@ class Action:
     frame: dict[str, Any] | None  # declared effects (FrameSpec.to_json()), if any
     created_at: float
     deadline: float | None = None
+    salt: str = field(default="")
 
     @property
     def args_digest(self) -> str:
-        return args_digest(self.args)
+        return args_digest(self.args, self.salt)
 
     def body(self) -> dict[str, Any]:
         """Everything the digest covers. Arguments are included in full."""
@@ -62,6 +70,7 @@ class Action:
             "tool": {"name": self.tool, "version": self.tool_version, "schema_digest": self.schema_digest},
             "args": self.args, "args_digest": self.args_digest, "authority": self.authority,
             "frame": self.frame, "created_at": self.created_at, "deadline": self.deadline,
+            "salt": self.salt,
         }
 
     @property
@@ -71,7 +80,7 @@ class Action:
     def public(self) -> dict[str, Any]:
         """The envelope without the argument values (for receipts)."""
         b = self.body()
-        del b["args"]
+        del b["args"], b["salt"]
         b["digest"] = self.digest
         return b
 
@@ -82,4 +91,4 @@ class Action:
         return cls(action_id=b["action_id"], idempotency_key=b["idempotency_key"], actor=b["actor"],
                    run_id=b["context"]["run_id"], tool=b["tool"]["name"], tool_version=b["tool"]["version"],
                    schema_digest=b["tool"]["schema_digest"], args=b["args"], authority=b["authority"],
-                   frame=b["frame"], created_at=b["created_at"], deadline=b["deadline"])
+                   frame=b["frame"], created_at=b["created_at"], deadline=b["deadline"], salt=b["salt"])

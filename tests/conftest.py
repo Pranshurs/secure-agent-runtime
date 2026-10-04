@@ -42,3 +42,9 @@ def rt(store: Store, app: NotesApp):
 
 def execution_events(store: Store) -> int:
     return len(store.events(kind="call.executing"))
+
+
+def cred(rt, who: str, **kw) -> str:
+    """A one-time approval credential for ``who`` (the demo authenticator stands in for the
+    host's real identity system)."""
+    return rt.authenticator.issue(who, **kw)

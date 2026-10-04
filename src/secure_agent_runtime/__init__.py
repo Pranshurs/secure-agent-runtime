@@ -4,6 +4,8 @@ Models propose actions. The runtime decides whether they may execute, makes retr
 safe, reconciles uncertain outcomes, and records what each action changed.
 """
 
+import logging
+
 from .action import Action
 from .agent import Agent, RunResult
 from .contracts import (
@@ -30,4 +32,6 @@ __all__ = [
     "RunResult", "Runtime", "SARError", "Store", "ToolContext", "ToolRegistry", "ToolSpec", "Unknown",
     "Verdict", "build_receipt", "check_frame", "receipt_json_schema", "verify_receipt",
 ]
+# A library must not print log records unless the application configures logging.
+logging.getLogger(__name__).addHandler(logging.NullHandler())
 __version__ = "0.2.0.dev0"
