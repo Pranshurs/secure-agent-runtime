@@ -43,7 +43,7 @@ packages = ["src/secure_agent_runtime"]
 
 [tool.hatch.build.targets.sdist]
 # What a user needs to build, test and audit the package; not repo tooling or AI notes.
-include = ["src/", "tests/", "scripts/", "docs/", "README.md", "CONTRIBUTING.md", "LICENSE", "pyproject.toml"]
+include = ["src/", "tests/", "scripts/", "docs/", "examples/", "README.md", "CONTRIBUTING.md", "LICENSE", "pyproject.toml"]
 exclude = ["**/__pycache__", "**/*.pyc"]
 
 [tool.mypy]

@@ -71,3 +71,13 @@ def test_verify_receipt_cli(receipt_file):
 def test_schema_cli():
     p = cli("schema")
     assert p.returncode == 0 and json.loads(p.stdout)["title"] == "SAR Agent Receipt v1"
+
+
+def test_readme_quick_start_runs_and_a_rerun_replays_instead_of_refunding_again(tmp_path):
+    pytest.importorskip("cryptography")
+    script = os.path.join(os.path.dirname(__file__), os.pardir, "examples", "quickstart.py")
+    runs = [subprocess.run([sys.executable, script], cwd=tmp_path, capture_output=True, text=True, timeout=120)
+            for _ in range(2)]
+    assert [r.returncode for r in runs] == [0, 0], runs[0].stderr + runs[1].stderr
+    assert runs[0].stdout.split() == ["awaiting_approval", "succeeded", "[]"]
+    assert runs[1].stdout.split() == ["succeeded", "succeeded", "[]"]  # replayed from sar.db, not re-run

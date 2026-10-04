@@ -6,8 +6,11 @@
 > reconciles uncertain outcomes, and proves what the agent changed.
 
 Status: **pre-alpha (0.2.0.dev0)**. A research and portfolio project, built openly with
-AI coding agents (Claude Code). Not published on PyPI, and not used in production by
-anyone yet.
+AI coding agents (Claude Code). It is not on PyPI, and nobody uses it in production.
+
+SAR is a library that sits between an agent (any framework, any model) and the tools that
+change things. It complements agent policy and governance frameworks and durable workflow
+engines; it does not replace them (see [docs/ECOSYSTEM_POSITIONING.md](docs/ECOSYSTEM_POSITIONING.md)).
 
 ## The failure it is built for
 
@@ -27,16 +30,17 @@ UNSAFE BASELINE (retry on error)
 
 SAR, response lost AFTER the refund
   proposed refund(order=821, amount_inr=4500) -> awaiting_approval
-  finance-lead approved action sha256:...
+  finance-lead approved action sha256:f57d4ff3f9b2c4e8...
   dispatch 1 -> EFFECT_UNKNOWN (tool raised ConnectionLost)
   agent retries the same call -> EFFECT_UNKNOWN, no dispatch
   reconcile -> SUCCEEDED (reconciled: effect was applied)
   refunds issued: 1   total refunded: ₹4,500   provider calls: 1
-  receipt rcpt_...: outcome VERIFIED, dispatches 1, verification OK
+  receipt rcpt_...: outcome VERIFIED, dispatches 1, Ed25519 signature, verification OK
 ```
 
-The same demo covers the request being lost *before* the refund. Reconciliation then
-says "not applied", SAR dispatches once more, and the customer still gets one refund.
+The demo also covers the request being lost *before* the refund. Reconciliation then says
+"not applied", SAR dispatches once more, and the customer still gets exactly one refund.
+Each refund runs in its own worker process, which SAR can kill.
 
 ## …and the one an outcome check misses
 
@@ -52,35 +56,22 @@ SLOPPY AGENT
   OUTCOME:                     VIOLATED
 ```
 
-The sloppy agent did bump the version. It also deleted a failing test. SAR's
+The sloppy agent did bump the version. It also deleted a test and edited the README. SAR's
 **frame condition** catches what it changed beyond the task.
 
-## Quick start (about five minutes)
+## Quick start
 
 ```bash
 git clone https://github.com/Pranshurs/secure-agent-runtime && cd secure-agent-runtime
-pip install -e .
-secure-agent-runtime demo            # refund, frame and notes demos
+pip install -e '.[signing]'      # 'signing' adds Ed25519 receipts (cryptography)
+secure-agent-runtime demo        # refund, frame and notes demos
+python examples/quickstart.py    # the code below; run it twice
 ```
 
-Python 3.10+. The only runtime dependency is pydantic.
+Python 3.10–3.13 on Linux or macOS. The only required dependency is pydantic.
 
 ```python
-from pydantic import BaseModel, ConfigDict
-from secure_agent_runtime import (Applied, Effect, NotApplied, Policy, Principal, Runtime,
-                                  Store, ToolRegistry)
-
-class RefundIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    order: int
-    amount_inr: int
-
-class RefundOut(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    refund_id: str
-
 reg = ToolRegistry()
-# `payments` stands for your provider's client; see examples/refund.py for a runnable mock.
 
 @reg.tool(input=RefundIn, output=RefundOut, effect=Effect.EXTERNAL, version="2026-10")
 def refund(args, ctx):
@@ -89,164 +80,203 @@ def refund(args, ctx):
 
 @reg.reconciler("refund")
 def find_refund(args, ctx):                       # "did this action's effect happen?"
-    r = payments.find(idempotency_key=ctx.idempotency_key)
-    return Applied(RefundOut(refund_id=r.id)) if r else NotApplied()
+    rid = payments.refunds.get(ctx.idempotency_key)
+    return Applied(RefundOut(refund_id=rid)) if rid else NotApplied()
 
-rt = Runtime(registry=reg, policy=Policy(), store=Store("sar.db"),
-             principals=[Principal("support-agent", grants=frozenset({"refund"})),
-                         Principal("finance-lead", can_approve=True)])
+auth = TokenAuthenticator()                       # demo only: use your identity provider
+with Store("sar.db") as store:
+    rt = Runtime(registry=reg, policy=Policy(), store=store, authenticator=auth,
+                 principals=[Principal("support-agent", grants=frozenset({"refund"})),
+                             Principal("finance-lead", can_approve=True)])
 
-o = rt.propose(run_id="ticket-77", principal_id="support-agent", call_id="call_1",
-               tool="refund", arguments={"order": 821, "amount_inr": 4500})
-rt.approve(o.key, approver_id="finance-lead", action_digest=o.action_digest)
-o = rt.execute(o.key)                             # succeeded | effect_unknown | ...
-if o.state == "effect_unknown":
-    o = rt.reconcile(o.key)                       # never blindly re-dispatched
-receipt = rt.receipt(o.key, signing_key=b"...")   # Agent Receipt, sar.receipt/v1
+    o = rt.propose(run_id="ticket-77", principal_id="support-agent", call_id="call_1",
+                   tool="refund", arguments={"order": 821, "amount_inr": 4500})
+    if o.state == "awaiting_approval":            # a rerun replays the recorded outcome
+        credential = auth.issue("finance-lead", scope=o.action_digest)
+        rt.approve(o.key, credential=credential, action_digest=o.action_digest)
+
+    o = rt.execute(o.key)                         # succeeded | effect_unknown | failed | ...
+    if o.state == "effect_unknown":
+        o = rt.reconcile(o.key)                   # asks find_refund; never blindly re-runs
+    receipt = rt.receipt(o.key, signer=Ed25519Signer.generate("ops-2026-10"))
 ```
+
+The full file, with imports and a stand-in payment client, is
+[examples/quickstart.py](examples/quickstart.py). A test runs it twice and checks that
+the second run replays the first instead of refunding again.
 
 ## How it works
 
 ```
-proposal → canonical action → authority → approval (bound to the digest)
-        → durable claim (CAS) → tool → outcome / reconciliation
-        → frame-condition check → Agent Receipt
+proposal → canonicalization → authority → exact-argument approval → durable execution
+        → consequential effect → safe retry / reconciliation → frame verification
+        → Agent Receipt
 ```
 
-* **Canonical action.** Validated arguments go into a versioned envelope
-  (`sar.action/v1`) with the actor, run, idempotency key, tool name, version and schema
-  digest, declared effects and deadline. Its SHA-256 digest is the action's identity.
-  Changing any of these fields changes the digest (`tests/test_action.py`).
+* **Canonical action.** Validated arguments go into a versioned envelope (`sar.action/v1`)
+  with the actor, run, idempotency key, tool name, version and schema digest, declared
+  effects, deadline and a per-action salt. Its SHA-256 digest is the action's identity.
 * **Authority.** A default-deny policy over structured facts only: principal grants,
-  operator constraints, and the tool's registered effect. Model text, tool descriptions
-  and MCP annotations never reach it.
-* **Argument-bound approval.** An approver approves a digest. Approving
-  `refund(821, 1000)` can't authorise `refund(821, 10000)`, a new tool version, a changed
-  schema or a looser frame. `execute` re-derives the digest from the current tool
-  definition just before dispatch.
-* **Durable state machine.** SQLite with compare-and-set transitions, a closed
-  transition table and attempt fencing. `effect_unknown` is an explicit state for "the
-  tool may have acted and we don't know", and only reconciliation leaves it. See
-  [docs/TRANSACTION_SEMANTICS.md](docs/TRANSACTION_SEMANTICS.md).
-* **Frame conditions.** An observer snapshots the state the tool may touch (a directory,
-  a ledger) before and after. The operator declares required, allowed and forbidden
-  changes; anything undeclared fails. See [docs/FRAME_CONDITIONS.md](docs/FRAME_CONDITIONS.md).
-* **Agent Receipts.** JSON with a published schema. It records the action envelope
-  (argument values only as digests), policy decision, approval, execution, result
-  digest, observed versus declared effects, and its audit events. It is protected by a
-  digest plus an optional HMAC, and can be verified against the store. See
-  [docs/AGENT_RECEIPTS.md](docs/AGENT_RECEIPTS.md).
-* **Tamper-evident audit.** Every transition appends a hash-chained event in the same
-  transaction.
+  operator constraints and the tool's registered effect. Model text, tool descriptions and
+  MCP annotations never reach it.
+* **Exact-argument approval.** A person approves one digest, through your
+  `Authenticator`. The approval records who authenticated, how, and which one-time
+  credential was used; a credential can be scoped to a single digest and can't be reused.
+  Approving `refund(821, 1000)` can't authorise `refund(821, 10000)`, a new tool
+  version, a changed schema or a looser frame. `execute` re-derives the digest from the
+  current tool definition and re-runs policy just before dispatch.
+* **Durable execution.** SQLite with compare-and-set transitions, a closed transition
+  table and attempt fencing, one owner per database file. Every transition and its
+  hash-chained audit event commit together. A crash leaves `executing` rows that become
+  `effect_unknown` on restart; nothing is re-dispatched automatically.
+* **Killable workers.** A tool declared `isolation="process"` runs in a fresh worker
+  process per attempt. On timeout the worker is killed, so it can't finish its effect
+  later; its messages carry the attempt's token. On Linux a worker also dies with its
+  runtime.
+* **Reconciliation.** `effect_unknown` means "the tool may have acted and we don't know".
+  Only the tool's reconciler (or an authenticated person, `resolve`) leaves it: applied →
+  `succeeded`; not applied → `approved`, eligible for one more dispatch.
+* **Frame conditions.** An observer snapshots what the tool may touch before and after.
+  The operator declares required, allowed and forbidden changes; anything undeclared
+  fails. See [docs/FRAME_CONDITIONS.md](docs/FRAME_CONDITIONS.md).
+* **Agent Receipts.** JSON with a published schema: the action envelope (argument values
+  only as salted digests), the decision, the authenticated approval, execution, result
+  digest, observed versus declared effects and the audit events. Signed with Ed25519 (or
+  HMAC), and verifiable against the store. See [docs/AGENT_RECEIPTS.md](docs/AGENT_RECEIPTS.md).
+* **Telemetry (optional).** OpenTelemetry spans and metrics without argument values,
+  results or credentials. A failing exporter can't change a decision.
+
+State machine and invariants: [docs/TRANSACTION_SEMANTICS.md](docs/TRANSACTION_SEMANTICS.md).
+
+## Security model, in short
+
+SAR trusts the operator's code and configuration (tool contracts, policy, principals,
+authenticator, keys) and the host it runs on. It does not trust the model, tool
+descriptions, MCP annotations, caller-supplied approver names or anything a tool returns
+before validation. The threat model, with an OWASP agentic-risk mapping marked
+MITIGATED / PARTIAL / OUT OF SCOPE, is [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 
 ## What SAR is not
 
-It is **not a sandbox.** It doesn't replace containers, seccomp, namespaces, VMs or
-network policy, and it doesn't stop a tool from touching what it can reach. SAR's layer
-is *authority + transaction semantics + uncertain-effect reconciliation + frame
-conditions + receipts*. Run tools inside a sandbox; let SAR decide whether, and how many
-times, they run and record what they changed. See [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md).
+It is **not a sandbox.** It doesn't replace containers, seccomp, VMs or network policy,
+and a process-isolated tool can still touch whatever its process can reach. SAR decides
+*whether* and *how many times* a call runs and records *what it changed*. Run tools inside
+a sandbox. See [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md).
 
 It is **not exactly-once.** It gives at most one dispatch per approval and never
-re-dispatches an unknown outcome. That turns into "exactly one effect" only when the
-tool can be reconciled. See [docs/TRANSACTION_SEMANTICS.md](docs/TRANSACTION_SEMANTICS.md).
+re-dispatches an unknown outcome. That becomes "exactly one effect" only when the tool
+can be reconciled. It is not formally verified, and it is not secure against a
+compromised host.
 
 ## Guarantees and their evidence
 
 | guarantee | tests |
 |---|---|
 | changed args, tool version, schema or frame after approval → blocked | `test_transactions.py::test_approval_for_1000_does_not_authorise_10000`, `test_tool_upgrade_after_approval_blocks_dispatch`, `test_action.py::test_output_schema_change_after_approval_blocks_dispatch`, `test_effects.py::test_declared_frame_is_part_of_what_was_approved` |
+| approval needs an authenticated approver; scoped, one-time credentials | `test_auth_and_signing.py::test_a_bare_principal_id_is_not_a_credential`, `test_credential_scoped_to_another_action_is_refused`, `test_credential_replay_is_refused`, `test_misbehaving_authenticator_fails_closed` |
 | unauthorised action → blocked, tool never invoked | `test_notes_slice.py` §1, `test_agent.py::test_injected_instructions_cannot_make_a_call_allowed` |
 | duplicate or concurrent duplicate → one dispatch | `test_transactions.py::test_concurrent_duplicate_dispatch_moves_money_once`, `test_conflicting_reuse_of_an_idempotency_key_fails_closed` |
 | response lost after effect → reconciled, not re-run | `test_transactions.py::test_reconciliation_finds_the_refund_and_closes_the_action` |
 | stale reconciler or late worker can't decide a later attempt | `test_transactions.py::test_stale_reconciliation_cannot_reopen_a_later_attempt`, `test_late_worker_*` |
-| crash at claim or effect boundaries → `effect_unknown`, recoverable | `test_transactions.py::test_crash_after_claim_before_dispatch`, `test_crash_after_effect_before_recording` |
+| the runtime process killed at each boundary → `effect_unknown`, recovered on restart | `test_process_crashes.py::test_runtime_killed_during_dispatch`, `test_runtime_killed_while_the_effect_is_executing`, `test_runtime_killed_during_reconciliation`, `test_runtime_killed_after_completion_replays_without_redispatch` |
+| a timed-out worker is killed and can't act later | `test_process_crashes.py::test_timed_out_worker_is_killed_and_cannot_act_later` |
 | unrelated or forbidden side effect → receipt `violated` | `test_effects.py::test_sloppy_agent_passes_outcome_check_but_fails_frame`, `test_forbidden_wins_even_over_a_requirement` |
-| audit or receipt tampering → detected | `test_notes_slice.py` §8, `test_receipts.py` |
+| audit or receipt tampering → detected; Ed25519 checks | `test_notes_slice.py` §8, `test_receipts.py`, `test_auth_and_signing.py::test_ed25519_*` |
 
-## Tests, mutants, benchmark
+## Tests, mutants, stress, benchmark
 
 ```bash
 pip install -e '.[dev]'
-pytest                                # 314 tests
-python scripts/mutation_test.py       # 143 mutants: 139 killed, 0 survived, 4 equivalent
-python scripts/bench.py               # per-action overhead on your machine
+pytest                                   # @@TESTS@@
+python scripts/mutation_test.py          # @@MUTANTS@@
+python scripts/stress.py --seeds 1 2 3 4 5 6 7 8 9 10 --actions 300 --threads 16 --rounds 3
+python scripts/bench.py                  # latency and throughput on your machine
 ```
 
-**Mutation testing.** Each mutant in `scripts/mutation_test.py` is a hand-written change
-that disables or weakens one invariant. Examples: drop the attempt fence, let a
-requirement override a forbidden glob, skip the digest re-check at dispatch. The script
-refuses to start unless the unmutated suite passes, runs every mutant on a temporary
-copy, and fails if any survives. Mutants that can't change behaviour are declared
-*equivalent* and printed with the reason, so they aren't hidden. The four equivalent mutants are:
+**Mutation testing.** `scripts/mutation_test.py` holds @@MUTANT_N@@ deliberately
+constructed safety mutants. Each is a hand-written change that disables or weakens one
+rule: drop the attempt fence, accept a credential twice, let a requirement override a
+forbidden glob, skip the digest re-check, never close a store. The script refuses to
+start unless the unmutated suite passes, runs every mutant on a temporary copy, and fails
+if any survives. Result: **@@MUTANT_N@@ mutants, @@KILLED@@ killed, @@EQUIV@@ demonstrated
+behaviorally equivalent, 0 surviving non-equivalent mutants.** The equivalent ones are
+printed with their reasons:
 
-* `C10`: a no-op flag in error formatting; `C11` covers actually echoing input.
+* `C10`: a flag in error formatting whose extra field is never read; `C11` covers echoing input.
 * `S12`: a sequence check made redundant by the hash chain.
 * `R13`: a fast-path early return; the compare-and-set claim is the real guard.
-* `R48`: the attempt fence on a late worker's result. It is unreachable because
-  `reconcile` and `resolve` refuse while that worker is alive. It is kept as defence
-  in depth.
+* `R48`, `D9`: attempt fencing of a late worker's result, and worker eviction. Both are
+  unreachable because `reconcile` and `resolve` refuse while the earlier worker is alive.
+* `I3`: the token check on worker messages. Each attempt has its own pipe, written only by
+  SAR's worker code with that attempt's token, so a foreign token can't arrive.
 
-The list is curated, not generated: it targets the invariants this README claims, not
-every line. CI runs it on every pull request.
+The last three are kept as defence in depth.
 
-**Two independent adversarial reviews** (AI subagents told to break the guarantees
-through the public API) found real bugs:
-* hostile JSON crashing `propose`;
-* stuck `executing` states;
-* a stale-reconcile ABA race;
-* a late worker completing a later attempt;
-* receipts not bound to store state;
-* a requirement able to override a forbidden glob.
+The list is curated, not generated: it targets the rules this README claims, not every
+line. CI runs it on every pull request.
 
-Each is fixed and has a regression test (`tests/test_hostile_inputs.py` and the tests
-named above).
+**Stress.** `scripts/stress.py` runs seeded rounds against a file-backed store and
+ledger:
+* duplicate proposals racing each other;
+* concurrent approve / execute / reconcile / cancel;
+* transient faults (lost responses, lost requests, slow and timed-out tools,
+  exceptions), with about 10% of actions in killable worker processes;
+* forged approvals (wrong digest, wrong scope, replayed credential) racing the real
+  approver.
 
-**Overhead** from `python scripts/bench.py -n 1000` on the development container
-(Python 3.11, Linux x86_64, 4 CPUs). Your numbers will differ:
+It then checks, against the ledger:
+* at most one effect per action, and every action settled;
+* no deadlock;
+* the audit chain verifies;
+* every receipt verifies against the store;
+* tampering is detected;
+* no forged approval is accepted;
+* no false "verified" frame.
 
-| scenario                                       | median µs |    p95 µs |
-|------------------------------------------------|-----------|-----------|
-| direct tool call (no SAR)                      |       1.9 |       2.1 |
-| read: propose + execute, SQLite :memory:       |    1639.6 |    2199.6 |
-| read: propose + execute, SQLite file (WAL)     |    2821.1 |    3797.4 |
-| write: propose + approve + execute             |    1850.3 |    2234.3 |
-| refund: approve + execute + frame check*       |    7561.2 |   11559.6 |
-| replay of a completed action                   |     574.4 |     827.6 |
-| build receipt                                  |    1107.7 |    1329.5 |
+Each of those checks was shown to fail against a deliberately broken copy of SAR.
+@@STRESS@@
 
-\* The refund observer snapshots the whole mock ledger, which grows from 0 to 1050 refunds during the run, so later iterations cost more.
+**Reviews.** Independent cold reviews (AI subagents told to break the guarantees through
+the public API) found real bugs. Each is fixed with a regression test; see
+[docs/REVIEWS.md](docs/REVIEWS.md).
 
-Most of the cost is one SQLite transaction per state change plus a worker thread per
-dispatch. It is fine for consequential actions (payments, deploys, file edits) and too
-slow for hot inner loops.
+**Overhead.** @@BENCH@@
+
+## Platforms
+
+Linux is the primary target. macOS runs the full suite in CI; there, an orphaned worker
+process can outlive a killed runtime (Linux uses `PR_SET_PDEATHSIG`), so reconcile again
+after a crash. **Windows is not supported** for file-backed stores (no `fcntl` locking).
 
 ## Limitations
 
-* **Python threads can't be killed.** A timed-out tool keeps running unless it watches
-  `ctx.cancel`. SAR marks the action `effect_unknown` and defers reconciliation until
-  that thread ends. Real isolation needs a subprocess or a sandbox.
-* **At most once per approval, not exactly once.** Without a reconciler an uncertain
-  outcome waits for a human (`resolve`).
-* **Frame conditions detect, they don't prevent or undo,** and only within what the
-  observer snapshots.
-* **The audit chain and receipts are tamper-evident, not tamper-proof.** Someone with
-  full write access to the database can rebuild everything consistently. Truncation is
-  caught only against an external anchor. HMAC is symmetric, so a key holder can forge.
-  Asymmetric signing isn't implemented yet.
-* **In-process, single node.** One SQLite file per process; multiple processes on one
-  file haven't been tested. Transcripts in `Agent` are in memory.
-* **No authentication.** The code calling `approve`/`resolve` must authenticate the
-  human. SAR trusts the id it's given.
-* **No framework adapters yet** (MCP, OpenAI Agents, LangGraph, Anthropic are planned).
+* **Thread-isolated tools can't be killed.** Python threads can't be stopped. A timed-out
+  thread tool keeps running unless it watches `ctx.cancel`; SAR marks the action
+  `effect_unknown` and defers reconciliation until the thread ends. Use
+  `isolation="process"` for tools that must be stoppable. That costs a process start per
+  attempt (see the benchmark) and needs an importable, module-level tool.
+* **At most once per approval, not exactly once.** Without a reconciler, an uncertain
+  outcome waits for a person (`resolve`).
+* **One process per database.** A file lock refuses a second owner. Several processes
+  sharing one store are not supported yet; shard by database instead.
+* **Frame conditions detect; they don't prevent or undo,** and only within what the
+  observer snapshots, at two instants. Concurrent writers show up as violations.
+* **Tamper-evident, not tamper-proof.** Someone with full write access to the database
+  can rebuild it consistently. Truncation is caught only against a chain head you keep
+  elsewhere (`store.head()`). HMAC receipts are symmetric. Key management (rotation,
+  revocation) is yours.
+* **The demo `TokenAuthenticator` is not for people.** Plug in your identity provider.
+* **No framework adapters yet.** MCP, OpenAI Agents, LangGraph and Anthropic adapters are
+  planned, MCP last.
 * **The receipt schema is v1 but not frozen** before 1.0.
 
 ## Documentation
 
 [Architecture](docs/ARCHITECTURE.md) · [Transaction semantics](docs/TRANSACTION_SEMANTICS.md) ·
 [Agent Receipts](docs/AGENT_RECEIPTS.md) · [Frame conditions](docs/FRAME_CONDITIONS.md) ·
-[Threat model](docs/THREAT_MODEL.md) · [Integrations](docs/INTEGRATIONS.md) ·
-[Contributing](CONTRIBUTING.md) · [Design notes](docs/DESIGN_NOTES.md)
+[Threat model](docs/THREAT_MODEL.md) · [Operations](docs/OPERATIONS.md) ·
+[Integrations](docs/INTEGRATIONS.md) · [Ecosystem positioning](docs/ECOSYSTEM_POSITIONING.md) ·
+[Reviews](docs/REVIEWS.md) · [Contributing](CONTRIBUTING.md) · [Design notes](docs/DESIGN_NOTES.md)
 
 ## Licence
 
