@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 
 import jsonschema
 import pytest
@@ -65,7 +66,23 @@ def test_receipts_carry_digests_not_argument_or_result_values(refunded):
     assert "4500" in json.dumps(r["effects"]["declared"]) and "rf_0001" in json.dumps(r["effects"]["check"])
     rest = {k: v for k, v in r.items() if k != "effects"}
     rest["action"] = {k: v for k, v in r["action"].items() if k != "frame"}
-    assert "4500" not in json.dumps(rest) and "rf_0001" not in json.dumps(rest)
+    # Compare values, not the JSON text: a random salted digest contains "4500" in about 2% of runs.
+    values = [v for v in _leaves(rest) if not (isinstance(v, str) and _HASH.fullmatch(v))]
+    assert 4500 not in values and not any(isinstance(v, str) and ("4500" in v or "rf_0001" in v) for v in values)
+
+
+_HASH = re.compile(r"(sha256:)?[0-9a-f]{64}|rcpt_[0-9a-f]{24}")
+
+
+def _leaves(x):
+    if isinstance(x, dict):
+        for v in x.values():
+            yield from _leaves(v)
+    elif isinstance(x, list):
+        for v in x:
+            yield from _leaves(v)
+    else:
+        yield x
 
 
 @pytest.mark.parametrize("path,value", [
