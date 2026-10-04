@@ -598,7 +598,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("-k", default="", help="only mutants whose id or rule contains this")
     ap.add_argument("-j", type=int, default=os.cpu_count() or 2)
-    ap.add_argument("--timeout", type=float, default=60)
+    ap.add_argument("--timeout", type=float, default=600,
+                    help="seconds per suite run; only a guard against a mutant that hangs (the suite takes ~1 min)")
     ns = ap.parse_args()
     selected = [m for m in MUTANTS if ns.k.lower() in (m.id + " " + m.rule).lower()]
     ids = [m.id for m in MUTANTS]
