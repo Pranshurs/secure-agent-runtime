@@ -14,24 +14,31 @@ all supplied by the operator, plus the validated arguments. Model text never rea
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
+
+from pydantic import BaseModel
 
 from .contracts import (
     ToolRegistry,
     args_hash,
     canonical_json,
     invoke,
+    parse_input,
+    plain_json,
     request_hash,
-    validate_input,
     validate_output,
 )
 from .policy import Policy, Principal, Verdict, approval_refusal
 from .store import CallRow, Store
 
 POLICY_APPROVER = "policy:allow"
+MAX_ID_LEN = 256
+
+log = logging.getLogger(__name__)
 
 
 class RuntimeErrorBase(Exception):
@@ -106,10 +113,10 @@ class Runtime:
         principal = self._principals.get(principal_id)
         if principal is None:
             raise KeyError(f"unknown principal {principal_id!r}")
-        if not isinstance(run_id, str) or not run_id:
-            raise MalformedProposal("run_id must be a non-empty string")
-        if not isinstance(call_id, str) or not call_id:
-            raise MalformedProposal("call_id must be a non-empty string")
+        for label, value in (("run_id", run_id), ("call_id", call_id)):
+            if not isinstance(value, str) or not 0 < len(value) <= MAX_ID_LEN or plain_json(value) is None:
+                raise MalformedProposal(f"{label} must be a non-empty UTF-8 string of at most {MAX_ID_LEN}"
+                                        " characters")
         key = call_key(run_id, call_id)
         rh = request_hash(tool, arguments)
         # Classify first and let the primary key decide: a replay (or a racing duplicate)
@@ -130,19 +137,18 @@ class Runtime:
         return Outcome.of(row)
 
     def _classify(self, principal: Principal, tool: Any, arguments: Any) -> tuple[str, str, Any, str, str]:
-        tool_name = tool if isinstance(tool, str) else repr(tool)
-        stored_args = arguments
-        try:
-            canonical_json(arguments)
-        except (TypeError, ValueError):
-            stored_args = {"_unserialisable": type(arguments).__name__}
+        named = isinstance(tool, str) and plain_json(tool) is not None and len(tool) <= MAX_ID_LEN
+        tool_name = tool if named else f"<{type(tool).__name__}>"
+        stored_args = arguments if plain_json(arguments) is not None else {
+            "_unserialisable": type(arguments).__name__}
         raw_hash = request_hash(tool, arguments)
-        spec = self.registry.get(tool) if isinstance(tool, str) else None
+        spec = self.registry.get(tool) if named else None
         if spec is None:
             return "invalid", f"unknown tool {tool_name!r}", stored_args, raw_hash, tool_name
-        args, error = validate_input(spec, arguments)
-        if args is None:
+        model, error = parse_input(spec, arguments)
+        if model is None:
             return "invalid", f"invalid arguments: {error}", stored_args, raw_hash, tool_name
+        args = model.model_dump(mode="json")
         ah = args_hash(spec.name, args)
         decision = self.policy.decide(principal, spec, args)
         if decision.verdict is Verdict.DENY:
@@ -220,12 +226,12 @@ class Runtime:
         row = self._get(key)
         if row.state != "approved":
             return Outcome.of(row)
-        problem, args = self._pre_execution_check(row)
+        problem, model = self._pre_execution_check(row)
         if problem is not None:
             self.store.transition(key, "approved", "cancelled", reason=f"blocked at execution: {problem}")
             return Outcome.of(self._get(key))
         spec = self.registry.get(row.tool)
-        assert spec is not None and args is not None
+        assert spec is not None and model is not None
         # The executing event is committed before the tool is invoked, so the audit log can
         # over-count invocations after a crash (see recover()) but can never under-count.
         if not self.store.transition(key, "approved", "executing", event={"args_hash": row.args_hash}):
@@ -234,17 +240,20 @@ class Runtime:
         cancel = threading.Event()
 
         def finish(state: str, **fields: Any) -> None:
-            if not self.store.transition(key, "executing", state, **fields):
-                self.store.record(row.run_id, "call.late_result_discarded", {"would_have_been": state},
-                                  call_key=key)
+            try:
+                if not self.store.transition(key, "executing", state, **fields):
+                    self.store.record(row.run_id, "call.late_result_discarded", {"would_have_been": state},
+                                      call_key=key)
+            except Exception:  # e.g. the store was closed while a timed-out tool kept running
+                log.exception("could not record the result of call %s", key)
 
         def work() -> None:
             try:
-                raw = invoke(spec, args, cancel)
-            except Exception as exc:
+                raw = invoke(spec, model, cancel)
+            except BaseException as exc:  # SystemExit in a tool must not strand the call
                 finish("failed", reason=f"tool raised {type(exc).__name__}")
                 return
-            out, error = validate_output(spec, raw)
+            out, error = validate_output(spec, raw)  # never raises
             if out is None:
                 finish("output_rejected", reason=f"invalid output: {error}")
             else:
@@ -259,10 +268,10 @@ class Runtime:
                                   reason=f"no result within {spec.timeout_s}s; effect unknown")
         return Outcome.of(self._get(key))
 
-    def _pre_execution_check(self, row: CallRow) -> tuple[str | None, dict[str, Any] | None]:
+    def _pre_execution_check(self, row: CallRow) -> tuple[str | None, BaseModel | None]:
         """Re-check everything at the last moment, from stored facts and current config.
 
-        Returns (problem, None) or (None, args to invoke with).
+        Returns (problem, None) or (None, the input model to invoke the tool with).
         """
         spec = self.registry.get(row.tool)
         principal = self._principals.get(row.principal)
@@ -272,9 +281,10 @@ class Runtime:
             return "stored arguments do not match their hash", None
         if row.approved_hash != row.args_hash:
             return "approval does not match the stored arguments", None
-        args, _ = validate_input(spec, row.args)  # the tool's schema may have changed since
-        if args is None:
+        model, _ = parse_input(spec, row.args)  # the tool's schema may have changed since
+        if model is None or model.model_dump(mode="json") != row.args:
             return "stored arguments no longer validate", None
+        args = model.model_dump(mode="json")
         decision = self.policy.decide(principal, spec, args)
         if decision.verdict is Verdict.DENY:
             return f"policy now denies: {decision.reason}", None
@@ -284,7 +294,7 @@ class Runtime:
             refusal = approval_refusal(self._principals.get(row.approved_by or ""), row.principal)
             if refusal is not None:
                 return f"approval no longer valid: {refusal}", None
-        return None, args
+        return None, model
 
     # -- recovery ----------------------------------------------------------------- #
     def recover(self) -> list[str]:

@@ -140,10 +140,11 @@ class Store:
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 yield self._db
+                self._db.execute("COMMIT")
             except BaseException:
-                self._db.execute("ROLLBACK")
+                if self._db.in_transaction:  # also covers a failed COMMIT (disk full, busy)
+                    self._db.execute("ROLLBACK")
                 raise
-            self._db.execute("COMMIT")
 
     # -- audit ------------------------------------------------------------------ #
     def _append(self, db: sqlite3.Connection, run_id: str, call_key: str | None, kind: str,

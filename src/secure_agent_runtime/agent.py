@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from .runtime import MalformedProposal, Outcome, Runtime
+from .runtime import MalformedProposal, Outcome, ReplayDivergence, Runtime
 
 
 class Model(Protocol):
@@ -37,10 +37,12 @@ class _Run:
     messages: list[dict[str, Any]]
     waiting: list[tuple[str, str]] = field(default_factory=list)  # (model call id, key)
     steps: int = 0
+    finished: bool = False
 
 
 class Agent:
-    def __init__(self, runtime: Runtime, model: Model, principal_id: str, *, max_steps: int = 8) -> None:
+    def __init__(self, runtime: Runtime, model: Model, principal_id: str, *, max_steps: int = 8,
+                 max_calls_per_turn: int = 16) -> None:
         principal = runtime.principal(principal_id)
         if principal is None:
             raise KeyError(f"unknown principal {principal_id!r}")
@@ -48,6 +50,7 @@ class Agent:
         self.model = model
         self.principal = principal
         self.max_steps = max_steps
+        self.max_calls_per_turn = max_calls_per_turn
         self._runs: dict[str, _Run] = {}
 
     def start(self, run_id: str, user_message: str) -> RunResult:
@@ -60,6 +63,9 @@ class Agent:
     def resume(self, run_id: str) -> RunResult:
         """Continue after approvals or rejections. Still-pending calls keep the run paused."""
         run = self._runs[run_id]
+        if run.finished:
+            raise ValueError(f"run {run_id!r} has already finished")
+        self.runtime.expire_pending()
         still, outcomes = [], []
         for model_call_id, key in run.waiting:
             outcome = self.runtime.execute(key)
@@ -76,13 +82,19 @@ class Agent:
         return result
 
     def _loop(self, run_id: str) -> RunResult:
+        result = self._steps(run_id)
+        if result.status != "awaiting_approval":
+            self._runs[run_id].finished = True
+        return result
+
+    def _steps(self, run_id: str) -> RunResult:
         run = self._runs[run_id]
         outcomes: list[Outcome] = []
         tools = self.runtime.registry.schemas(self.principal.grants)
         while run.steps < self.max_steps:
             run.steps += 1
             turn = _parse_turn(self.model.respond(list(run.messages), tools))
-            if turn is None:
+            if turn is None or len(turn[1]) > self.max_calls_per_turn:
                 self.runtime.store.record(run_id, "model.malformed_output", {"step": run.steps})
                 return RunResult("malformed_model_output", outcomes=outcomes)
             text, calls = turn
@@ -95,8 +107,10 @@ class Agent:
                     outcome = self.runtime.propose(run_id=run_id, principal_id=self.principal.id,
                                                    call_id=call["id"], tool=call["name"],
                                                    arguments=call["arguments"])
-                except MalformedProposal:
-                    self.runtime.store.record(run_id, "model.malformed_output", {"step": run.steps})
+                except (MalformedProposal, ReplayDivergence) as exc:
+                    # ReplayDivergence: the model reused an earlier call id for a different call.
+                    self.runtime.store.record(run_id, "model.malformed_output",
+                                              {"step": run.steps, "error": type(exc).__name__})
                     return RunResult("malformed_model_output", outcomes=outcomes)
                 outcome = self.runtime.execute(outcome.key)
                 if outcome.state == "pending_approval":

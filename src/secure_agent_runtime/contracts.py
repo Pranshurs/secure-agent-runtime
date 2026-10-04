@@ -116,58 +116,96 @@ class ToolRegistry:
                 if allowed is None or n in allowed]
 
 
+MAX_JSON_BYTES = 64 * 1024  # per argument object or tool output
+
+
 def canonical_json(value: Any) -> str:
     """Deterministic JSON. Raises on anything that is not plain JSON (no silent str())."""
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
                       allow_nan=False)
 
 
+def plain_json(value: Any) -> str | None:
+    """Canonical JSON of ``value`` if it is plain, bounded, UTF-8-encodable JSON; else None.
+
+    Hostile input can make serialisation fail in many ways (lone surrogates, integers
+    beyond the int-to-str limit, nesting deep enough to hit the recursion limit), so any
+    exception means "not plain JSON".
+    """
+    try:
+        text = canonical_json(value)
+        size = len(text.encode("utf-8"))
+    except Exception:
+        return None
+    return text if size <= MAX_JSON_BYTES else None
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def args_hash(tool: str, args: dict[str, Any]) -> str:
     """Identity of a request's content. An approval is bound to exactly this hash."""
-    return hashlib.sha256(canonical_json({"tool": tool, "args": args}).encode()).hexdigest()
+    return _sha256(canonical_json({"tool": tool, "args": args}))
 
 
 def request_hash(tool: Any, raw_args: Any) -> str:
     """Identity of a *raw* proposal, used to detect replay divergence.
 
-    It must work for malformed proposals too, so anything not serialisable is hashed by
-    its type name and repr. It is never used to authorise anything.
+    It must work for malformed proposals too, so anything that is not plain JSON is
+    hashed by its type name only. It is never used to authorise anything.
     """
+    body = plain_json({"tool": tool, "args": raw_args})
+    if body is None:
+        body = canonical_json({"tool": type(tool).__name__, "unserialisable": type(raw_args).__name__})
+    return _sha256(body)
+
+
+def parse_input(spec: ToolSpec, raw: Any) -> tuple[BaseModel | None, str | None]:
+    """Validate raw arguments into the tool's input model. Returns (model, None) or (None, reason).
+
+    The model is accepted only if its JSON dump validates back to the same dump, so the
+    arguments that are hashed, approved and stored are exactly what the tool receives
+    (a validator that rewrites its value on every pass is refused).
+    """
+    if not isinstance(raw, dict):
+        return None, "arguments must be a JSON object"
+    text = plain_json(raw)
+    if text is None:
+        return None, f"arguments are not plain JSON or exceed {MAX_JSON_BYTES} bytes"
     try:
-        body = canonical_json({"tool": tool, "args": raw_args})
-    except (TypeError, ValueError):
-        body = canonical_json({"tool": repr(tool), "unserialisable": type(raw_args).__name__,
-                               "repr": repr(raw_args)})
-    return hashlib.sha256(body.encode()).hexdigest()
+        model = spec.input_model.model_validate_json(text, strict=True)
+        dumped = model.model_dump(mode="json")
+        again = spec.input_model.model_validate_json(canonical_json(dumped), strict=True)
+        stable = again.model_dump(mode="json") == dumped
+    except ValidationError as exc:
+        return None, _short(exc)
+    except Exception as exc:  # a validator that raises something else fails closed
+        return None, f"input validation raised {type(exc).__name__}"
+    if not stable:
+        return None, "input model does not round-trip; refusing to hash unstable arguments"
+    return model, None
 
 
 def validate_input(spec: ToolSpec, raw: Any) -> tuple[dict[str, Any] | None, str | None]:
     """Returns (validated JSON-mode args, None) or (None, reason)."""
-    if not isinstance(raw, dict):
-        return None, "arguments must be a JSON object"
-    try:
-        text = canonical_json(raw)
-    except (TypeError, ValueError):
-        return None, "arguments are not plain JSON"
-    try:
-        model = spec.input_model.model_validate_json(text, strict=True)
-    except ValidationError as exc:
-        return None, _short(exc)
-    return model.model_dump(mode="json"), None
+    model, error = parse_input(spec, raw)
+    return (model.model_dump(mode="json"), None) if model is not None else (None, error)
 
 
 def validate_output(spec: ToolSpec, raw: Any) -> tuple[dict[str, Any] | None, str | None]:
-    """Returns (validated JSON-mode output, None) or (None, reason)."""
-    if isinstance(raw, BaseModel):  # dumped, then validated like any other value
-        raw = raw.model_dump(mode="json")
+    """Returns (validated JSON-mode output, None) or (None, reason). Never raises."""
     try:
-        text = canonical_json(raw)
-    except (TypeError, ValueError):
-        return None, "output is not plain JSON"
-    try:
+        if isinstance(raw, BaseModel):  # dumped, then validated like any other value
+            raw = raw.model_dump(mode="json")
+        text = plain_json(raw)
+        if text is None:
+            return None, f"output is not plain JSON or exceeds {MAX_JSON_BYTES} bytes"
         return spec.output_model.model_validate_json(text, strict=True).model_dump(mode="json"), None
     except ValidationError as exc:
         return None, _short(exc)
+    except Exception as exc:
+        return None, f"output validation raised {type(exc).__name__}"
 
 
 _SAFE_LOC = re.compile(r"^[A-Za-z0-9_]{1,64}$")
@@ -183,7 +221,6 @@ def _short(exc: ValidationError) -> str:
     return "; ".join(f"{_loc(e['loc'])}: {e['msg']}" for e in exc.errors(include_input=False))[:500]
 
 
-def invoke(spec: ToolSpec, args: dict[str, Any], cancel: threading.Event) -> Any:
-    """Call the tool with a freshly validated model built from already-validated args."""
-    model = spec.input_model.model_validate_json(canonical_json(args), strict=True)
+def invoke(spec: ToolSpec, model: BaseModel, cancel: threading.Event) -> Any:
+    """Call the tool with the validated input model."""
     return spec.fn(model, cancel=cancel) if spec.accepts_cancel else spec.fn(model)
