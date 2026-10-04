@@ -1,18 +1,28 @@
-# Secure Agent Runtime: preserved design state (PAUSED 2026-10-04)
+# Secure Agent Runtime: design notes (history and research)
 
-Work is paused by owner priority. Resume only after Titanic, VDT, AI Process Consultant and
-the EmoNET audit are done. Nothing here is published; the repository is local only.
+Originally written 2026-10-04 while the project was paused; work resumed the same day with
+the first vertical slice. The sections below record the design and the dependency research
+behind it. For how the code works today, see the README and
+[TRANSACTION_SEMANTICS.md](TRANSACTION_SEMANTICS.md). Some early names and plans below were
+later changed: `outcome_unknown` and `timed_out` became `effect_unknown`; approvals are bound
+to the full action digest, not just an arguments hash; and tools can now run in a killable
+worker process (`isolation="process"`), not only in a thread.
 
 ## State of the code
-`src/secure_agent_runtime/` holds three first-draft modules. They are **untested and not
-yet wired together**:
-- `contracts.py`: `ToolSpec` (pydantic input and output models, a declared `Effect`,
-  timeout, idempotent flag, retries allowed only for idempotent tools), a registry, and the
-  canonical args hash.
-- `policy.py`: a deterministic, default-deny policy over (principal grants, argument
-  constraints, effect-based approval). It never reads model text.
-- `store.py`: SQLite with compare-and-set call transitions, plus a hash-chained audit log
-  appended in the same transaction as each transition. It also persists run state.
+**Direction change (2026-10-04).** SAR is now positioned as a framework-neutral
+*transactional execution layer*: canonical actions, authority, argument-bound approval,
+durable execution state with explicit `effect_unknown` and reconciliation, frame
+conditions, and Agent Receipts. It is deliberately not a sandbox, MCP firewall or policy
+proxy. The README and `docs/ARCHITECTURE.md` describe the current code. What changed
+from the first drafts:
+
+- `contracts.py`: kept strict pydantic validation. Added a tool version, schema digest,
+  reconciler, observer and frame builder, and dropped the retry rule.
+- `policy.py`: kept almost unchanged (default deny, constraints fail closed).
+- `store.py`: kept CAS plus the hash chain. Added a closed transition table with
+  `effect_unknown`, attempt fencing and per-action event lookup, and dropped the run
+  table.
+- New modules: `action.py`, `effects.py`, `receipts.py`, `runtime.py`, `agent.py`.
 
 ## Thesis
 The model proposes; the runtime disposes. Policy decisions use only structured facts:

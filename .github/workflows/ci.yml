@@ -1,0 +1,148 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: no job needs to write anything. There are no publishing credentials
+# in this workflow; untrusted pull-request code never sees a release secret.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e '.[dev]'
+      - run: ruff check .
+      - run: mypy src
+
+  test:
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          - os: macos-latest
+            python-version: "3.12"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -e '.[dev]'
+      - run: pytest
+      - name: README demo commands
+        run: secure-agent-runtime demo
+
+  deep:
+    # More generated sequences and fuzz cases than the per-version runs, plus a stress smoke run.
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e '.[dev]'
+      - name: Property and fuzz tests, deep
+        env:
+          SAR_PROPERTY_EXAMPLES: "1500"
+          SAR_FUZZ_EXAMPLES: "1000"
+        run: pytest tests/test_state_machine_properties.py tests/test_fuzz.py
+      - name: Process-crash tests, repeated
+        run: for i in 1 2 3; do pytest tests/test_process_crashes.py || exit 1; done
+      - name: Stress smoke
+        run: python scripts/stress.py --seeds 1 2 3 --actions 150 --threads 8 --rounds 1
+
+  package:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install build==1.6.1 twine==7.0.0 cyclonedx-bom==7.5.0
+      - name: Build wheel and sdist
+        run: python -m build
+      - run: twine check --strict dist/*
+      - name: Install the wheel in a fresh venv and use it from outside the checkout
+        run: |
+          python -m venv /tmp/venv
+          /tmp/venv/bin/pip install dist/*.whl
+          cd /tmp
+          /tmp/venv/bin/secure-agent-runtime demo
+          /tmp/venv/bin/secure-agent-runtime schema > /dev/null
+          /tmp/venv/bin/python -c "import secure_agent_runtime as s; print(s.__version__)"
+      - name: Install the sdist too
+        run: |
+          python -m venv /tmp/venv-sdist
+          /tmp/venv-sdist/bin/pip install dist/*.tar.gz
+          cd /tmp && /tmp/venv-sdist/bin/secure-agent-runtime demo refund
+      - name: SBOM of the installed runtime dependencies
+        run: |
+          python -m venv /tmp/venv-sbom
+          /tmp/venv-sbom/bin/pip install dist/*.whl
+          cyclonedx-py environment /tmp/venv-sbom/bin/python --output-format JSON -o dist/sbom.cdx.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist/
+
+  security:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pip-audit==2.10.1 bandit==1.9.4
+      - name: Known vulnerabilities in SAR's runtime dependency set (with all extras)
+        run: |
+          python -m venv /tmp/rt
+          /tmp/rt/bin/pip install '.[signing,otel]'
+          /tmp/rt/bin/pip freeze | grep -v '^secure-agent-runtime' > /tmp/runtime-requirements.txt
+          cat /tmp/runtime-requirements.txt
+          pip-audit -r /tmp/runtime-requirements.txt --no-deps --disable-pip
+      - name: Static security analysis
+        run: bandit -q -r src -c pyproject.toml
+      - name: Secret scanning (full history)
+        uses: trufflesecurity/trufflehog@4dd8831c5f12599465d4d45c3c447b4018a34c85 # v3.97.9
+        with:
+          extra_args: --results=verified,unknown
+
+  dependency-review:
+    # Needs the dependency graph, which private repositories only get with GitHub Advanced Security.
+    if: github.event_name == 'pull_request' && !github.event.repository.private
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+
+  mutation:
+    # Breaks each safety rule on purpose; fails if any non-equivalent mutant survives.
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e '.[dev]'
+      - run: python scripts/mutation_test.py --timeout 600

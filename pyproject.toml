@@ -1,0 +1,75 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "secure-agent-runtime"
+version = "0.2.0.dev0"
+description = "Transactional execution and verifiable side-effect receipts for AI agents."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Pranshu Raj" }]
+requires-python = ">=3.10"
+dependencies = ["pydantic>=2.7,<3"]
+urls = { Source = "https://github.com/Pranshurs/secure-agent-runtime" }
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+[project.scripts]
+secure-agent-runtime = "secure_agent_runtime.__main__:main"
+
+[project.optional-dependencies]
+# Ed25519-signed Agent Receipts.
+signing = ["cryptography>=42"]
+# OpenTelemetry spans and metrics (API only; bring your own SDK/exporter).
+otel = ["opentelemetry-api>=1.27"]
+dev = [
+    "pytest>=8", "pytest-timeout>=2.3", "hypothesis>=6.100", "ruff>=0.6", "mypy>=1.10", "jsonschema>=4.18",
+    "cryptography>=42", "opentelemetry-api>=1.27", "opentelemetry-sdk>=1.27",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/secure_agent_runtime"]
+
+[tool.hatch.build.targets.sdist]
+# What a user needs to build, test and audit the package; not repo tooling or AI notes.
+include = ["src/", "tests/", "scripts/", "docs/", "examples/", "README.md", "CONTRIBUTING.md", "LICENSE", "pyproject.toml"]
+exclude = ["**/__pycache__", "**/*.pyc"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src"]
+warn_unused_ignores = true
+
+[tool.bandit]
+# B101: asserts are used only for type narrowing after explicit checks.
+# B608: the only f-string SQL builds column lists from a fixed whitelist (store._UPDATABLE).
+skips = ["B101", "B608"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+timeout = 300
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# Mutant definitions are literal source snippets; wrapping them hurts readability.
+"scripts/mutation_test.py" = ["E501"]
