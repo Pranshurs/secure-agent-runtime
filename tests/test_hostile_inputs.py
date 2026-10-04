@@ -18,6 +18,10 @@ from secure_agent_runtime.runtime import MalformedProposal, Runtime
 
 from .conftest import execution_events
 
+# Deep enough to exceed every supported Python's JSON recursion limit (3.12's C encoder
+# accepts 5000 levels, 3.10/3.11 do not).
+DEEP = 100_000
+
 
 def deep(n):
     d: list = []
@@ -29,7 +33,7 @@ def deep(n):
 HOSTILE_ARGS = [
     {"title": "\ud800"},                       # lone surrogate: not encodable as UTF-8
     {"title": "todo", "n": 10 ** 5000},        # beyond the int-to-str digit limit
-    {"title": deep(5000)},                     # beyond the recursion limit
+    {"title": deep(DEEP)},                     # beyond the recursion limit
     {"title": "todo", "pad": "x" * MAX_JSON_BYTES},
     {"\ud800": 1},
 ]
@@ -46,7 +50,7 @@ def test_hostile_arguments_become_invalid_calls(rt, app, arguments):
     assert rt.store.verify_audit()[0]
 
 
-@pytest.mark.parametrize("tool", ["\ud800", deep(5000), "x" * 10_000], ids=["surrogate", "deep", "long"])
+@pytest.mark.parametrize("tool", ["\ud800", deep(DEEP), "x" * 10_000], ids=["surrogate", "deep", "long"])
 def test_hostile_tool_names_become_invalid_calls(rt, tool):
     o = rt.propose(run_id="r", principal_id=AGENT, call_id="c", tool=tool, arguments={})
     assert o.state == "invalid" and len(o.tool) < 100
@@ -110,7 +114,7 @@ def test_tool_raising_systemexit_is_failed_not_stuck(store):
     assert store.calls(state="executing") == []
 
 
-@pytest.mark.parametrize("value,label", [(deep(5000), "deep"), ("x" * (MAX_JSON_BYTES + 1), "huge"),
+@pytest.mark.parametrize("value,label", [(deep(DEEP), "deep"), ("x" * (MAX_JSON_BYTES + 1), "huge"),
                                          ("\ud800", "surrogate"), (10 ** 5000, "bigint")],
                          ids=["deep", "huge", "surrogate", "bigint"])
 def test_unserialisable_tool_output_is_rejected_not_stuck(store, value, label):
