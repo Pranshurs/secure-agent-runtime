@@ -583,6 +583,7 @@ def make_copy(tmp: Path) -> Path:
     root = tmp / "repo"
     shutil.copytree(ROOT / "src", root / "src")
     shutil.copytree(ROOT / "tests", root / "tests")
+    shutil.copytree(ROOT / "examples", root / "examples")  # the README quick start, run by a test
     shutil.copy(ROOT / "pyproject.toml", root / "pyproject.toml")
     return root
 
