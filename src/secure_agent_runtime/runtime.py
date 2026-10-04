@@ -21,6 +21,7 @@ all supplied by the operator, plus the validated arguments. Model text never rea
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -133,7 +134,8 @@ class Runtime:
         self.store = store
         self.approval_ttl_s = approval_ttl_s
         self._faults = faults or (lambda point, key: None)
-        self._before: dict[str, Snapshot] = {}  # in-memory pre-dispatch snapshots, with content
+        self._before: dict[str, tuple[int, Snapshot]] = {}  # key -> (attempt, pre-dispatch snapshot)
+        self._live: dict[str, threading.Thread] = {}  # key -> worker of the latest dispatch
         self._principals: dict[str, Principal] = {}
         for p in principals:
             if p.id in self._principals or p.id == POLICY_APPROVER:
@@ -158,7 +160,11 @@ class Runtime:
         key = call_key(run_id, call_id) if idempotency_key is None else idempotency_key
         if not isinstance(key, str) or not key or plain_json(key) is None:
             raise MalformedProposal("idempotency_key must be a non-empty UTF-8 string")
-        rh = request_hash(tool, arguments)
+        if deadline is not None and (isinstance(deadline, bool) or not isinstance(deadline, (int, float))
+                                     or not math.isfinite(deadline)):
+            raise ValueError("deadline must be a finite number (seconds since the epoch) or None")
+        deadline = None if deadline is None else float(deadline)
+        rh = request_hash(tool, arguments, {"deadline": deadline})
         now = self.store.now()
         state, reason, args, action, tool_name = self._classify(
             principal, tool, arguments, key=key, run_id=run_id, now=now, deadline=deadline)
@@ -314,7 +320,7 @@ class Runtime:
                                      event={"action_digest": row.action_digest, "attempt": attempt}):
             return Outcome.of(self._get(key))
         if before is not None:
-            self._before[key] = before
+            self._before[key] = (attempt, before)
         self._faults("after_claim", key)
 
         effectful = _effectful(spec)
@@ -323,7 +329,7 @@ class Runtime:
 
         def finish(state: str, **fields: Any) -> None:
             try:
-                if not self.store.transition(key, "executing", state, **fields):
+                if not self.store.transition(key, "executing", state, attempt=attempt, **fields):
                     self.store.record(row.run_id, "call.late_result_discarded", {"would_have_been": state},
                                       call_key=key)
             except Exception:  # e.g. the store was closed while a timed-out tool kept running
@@ -347,21 +353,25 @@ class Runtime:
                 finish("effect_unknown" if effectful else "output_rejected", reason=f"invalid output: {error}")
                 return
             finish("succeeded", result=out, result_digest=sha256_text(canonical_json(out)), reason="",
-                   frame_result=self._frame_result(spec, action, key))
+                   frame_result=self._frame_result(spec, action, key, attempt))
 
         worker = threading.Thread(target=work, name=f"sar-tool-{spec.name}", daemon=True)
+        self._live[key] = worker
         worker.start()
         worker.join(spec.timeout_s)
         if worker.is_alive():
             ctx.cancel.set()
             self.store.transition(key, "executing", "effect_unknown" if effectful else "failed",
-                                  reason=f"no result within {spec.timeout_s}s")
+                                  attempt=attempt, reason=f"no result within {spec.timeout_s}s")
         return Outcome.of(self._get(key))
 
-    def _frame_result(self, spec: ToolSpec, action: Action, key: str) -> dict[str, Any] | None:
+    def _frame_result(self, spec: ToolSpec, action: Action, key: str, attempt: int) -> dict[str, Any] | None:
         if spec.observer is None or action.frame is None:
             return None
-        before = self._before.pop(key, None)
+        cached = self._before.get(key)
+        before = None
+        if cached is not None and cached[0] == attempt:
+            before = self._before.pop(key)[1]
         if before is None:
             row = self.store.get_call(key)
             if row is None or row.before is None:
@@ -433,8 +443,15 @@ class Runtime:
             self.store.record(row.run_id, "reconcile.unavailable", {"why": "args no longer validate"},
                               call_key=key)
             return Outcome.of(row)
+        worker = self._live.get(key)
+        if worker is not None and worker.is_alive():
+            # The timed-out dispatch is still running here and could yet act; asking now
+            # could get "not applied" just before it applies. Wait for it to finish.
+            self.store.record(row.run_id, "reconcile.deferred", {"why": "dispatch still running"}, call_key=key)
+            return Outcome.of(row)
         reconciler = spec.reconciler
-        ctx = ToolContext(action_id=action.action_id, idempotency_key=key, attempt=row.dispatches,
+        attempt = row.dispatches
+        ctx = ToolContext(action_id=action.action_id, idempotency_key=key, attempt=attempt,
                           cancel=threading.Event())
         finding = _bounded(lambda: reconciler(model, ctx), spec.timeout_s)
         if isinstance(finding, Applied):
@@ -442,16 +459,17 @@ class Runtime:
             if out is None:
                 self.store.record(row.run_id, "reconcile.result_invalid", {"error": error}, call_key=key)
                 return Outcome.of(row)
-            self.store.transition(key, "effect_unknown", "succeeded", result=out,
-                                  result_digest=sha256_text(canonical_json(out)),
-                                  reason="reconciled: effect was applied",
-                                  frame_result=self._frame_result(spec, action, key),
-                                  event={"reconciled": "applied"})
+            if not self.store.transition(key, "effect_unknown", "succeeded", attempt=attempt, result=out,
+                                         result_digest=sha256_text(canonical_json(out)),
+                                         reason="reconciled: effect was applied",
+                                         frame_result=self._frame_result(spec, action, key, attempt),
+                                         event={"reconciled": "applied", "attempt": attempt}):
+                self.store.record(row.run_id, "reconcile.stale", {"attempt": attempt}, call_key=key)
         elif isinstance(finding, NotApplied):
-            self._before.pop(key, None)
-            self.store.transition(key, "effect_unknown", "approved",
-                                  reason="reconciled: effect not applied; may be dispatched again",
-                                  event={"reconciled": "not_applied"})
+            if not self.store.transition(key, "effect_unknown", "approved", attempt=attempt,
+                                         reason="reconciled: effect not applied; may be dispatched again",
+                                         event={"reconciled": "not_applied", "attempt": attempt}):
+                self.store.record(row.run_id, "reconcile.stale", {"attempt": attempt}, call_key=key)
         else:
             why = finding.reason if isinstance(finding, Unknown) else f"reconciler returned {type(finding).__name__}"
             self.store.record(row.run_id, "reconcile.unknown", {"why": (why or "undecided")[:200]}, call_key=key)
@@ -471,22 +489,31 @@ class Runtime:
         if refusal is not None:
             self.store.record(row.run_id, "resolve.refused", {"by": by, "reason": refusal}, call_key=key)
             raise ApprovalRefused(refusal)
+        worker = self._live.get(key)
+        if worker is not None and worker.is_alive():
+            raise ApprovalRefused("the last dispatch is still running; resolve after it finishes")
+        spec = self.registry.get(row.tool)
+        attempt = row.dispatches
         if applied:
-            spec = self.registry.get(row.tool)
             out = None
             if result is not None and spec is not None:
                 out, error = validate_output(spec, result)
                 if out is None:
                     raise ValueError(f"result does not validate: {error}")
-            self.store.transition(key, "effect_unknown", "succeeded", result=out,
-                                  result_digest=sha256_text(canonical_json(out)) if out is not None else None,
-                                  reason=f"resolved by {by}: effect was applied",
-                                  event={"resolved_by": by, "applied": True})
+            frame = None
+            if spec is not None and row.action is not None:
+                frame = self._frame_result(spec, Action.from_body(row.action), key, attempt)
+            ok = self.store.transition(key, "effect_unknown", "succeeded", attempt=attempt, result=out,
+                                       result_digest=sha256_text(canonical_json(out)) if out is not None else None,
+                                       reason=f"resolved by {by}: effect was applied", frame_result=frame,
+                                       event={"resolved_by": by, "applied": True, "attempt": attempt})
         else:
-            self._before.pop(key, None)
-            self.store.transition(key, "effect_unknown", "approved" if redispatch else "failed",
-                                  reason=f"resolved by {by}: effect not applied",
-                                  event={"resolved_by": by, "applied": False, "redispatch": redispatch})
+            ok = self.store.transition(key, "effect_unknown", "approved" if redispatch else "failed",
+                                       attempt=attempt, reason=f"resolved by {by}: effect not applied",
+                                       event={"resolved_by": by, "applied": False, "redispatch": redispatch,
+                                              "attempt": attempt})
+        if not ok:
+            raise ApprovalRefused("the action changed while it was being resolved")
         return Outcome.of(self._get(key))
 
     # -- recovery ----------------------------------------------------------------- #

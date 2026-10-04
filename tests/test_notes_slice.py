@@ -660,6 +660,9 @@ def test_store_refuses_unknown_fields_and_illegal_moves(rt):
         rt.store.transition(o.key, "awaiting_approval", "approved", action_json="{}")
     with pytest.raises(IllegalTransition):
         rt.store.transition(o.key, "succeeded", "approved")
+    for target in ("executing", "cancelled", "awaiting_approval"):  # only reconciliation leaves effect_unknown
+        with pytest.raises(IllegalTransition):
+            rt.store.transition(o.key, "effect_unknown", target)
     assert rt.store.get_call(o.key).state == "awaiting_approval"
 
 

@@ -26,7 +26,9 @@ from secure_agent_runtime.store import Store
     ("tests/**", "tests/a.py", True), ("tests/**", "tests/x/y.py", True), ("tests/**", "tests", False),
     ("tests/**", "src/tests/a.py", False), ("*.py", "a.py", True), ("*.py", "a/b.py", False),
     ("**/x.py", "x.py", True), ("**/x.py", "a/b/x.py", True), ("a?c", "abc", True), ("a?c", "a/c", False),
-    ("uv.lock", "uv.lock", True), ("uv.lock", "uvXlock", False), ("refunds/*", "refunds/rf_1", True),
+    ("uv.lock", "uv.lock", True), ("uv.lock", "uvXlock", False), ("uv.lock", "uv.lock.bak", False),
+    ("uv.lock", "x/uv.lock", False), ("a+b(c)", "a+b(c)", True), ("a+b(c)", "aab", False),
+    ("refunds/*", "refunds/rf_1", True),
 ])
 def test_glob_semantics(pattern, path, match):
     assert bool(compile_glob(pattern).match(path)) is match
@@ -78,6 +80,12 @@ def test_allowed_changes_are_fine_and_unlisted_ones_are_not():
     assert r.allowed == ["uv.lock"] and r.undeclared == ["new.txt"] and r.verdict == "violated"
 
 
+def test_forbidden_beats_allowed():
+    spec = FrameSpec(allowed=("**",), forbidden=("tests/**",))
+    r = check_frame(spec, entries(**{"tests/t.py": "a", "src/x.py": "a"}), entries(**{"src/x.py": "b"}))
+    assert r.forbidden == ["tests/t.py"] and r.allowed == ["src/x.py"] and r.verdict == "violated"
+
+
 def test_required_count_is_exact():
     spec = FrameSpec(required=(Required("refunds/*", "added", count=1),))
     one = check_frame(spec, {}, entries(**{"refunds/1": "x"}))
@@ -85,10 +93,21 @@ def test_required_count_is_exact():
     assert one.verdict == "verified" and two.verdict == "violated"
 
 
-def test_required_wins_over_forbidden_for_the_same_path():
-    spec = FrameSpec(required=(Required("tests/conftest.py"),), forbidden=("tests/**",))
-    r = check_frame(spec, entries(**{"tests/conftest.py": "a"}), entries(**{"tests/conftest.py": "b"}))
-    assert r.verdict == "verified"
+def test_forbidden_wins_even_over_a_requirement():
+    """A broad requirement must not launder a forbidden change into a verified one."""
+    spec = FrameSpec(required=(Required("*.key"),), forbidden=("secret.key",))
+    r = check_frame(spec, entries(**{"secret.key": "a"}), entries(**{"secret.key": "b"}))
+    assert r.verdict == "violated" and r.forbidden == ["secret.key"]
+    spec2 = FrameSpec(required=(Required("**", count=2),), forbidden=("tests/**",))
+    r2 = check_frame(spec2, entries(**{"a": "1", "tests/t": "1"}), entries(**{"a": "2", "tests/t": "2"}))
+    assert r2.verdict == "violated" and r2.forbidden == ["tests/t"]
+
+
+def test_one_change_cannot_satisfy_two_requirements():
+    spec = FrameSpec(required=(Required("a.txt"), Required("*.txt")))
+    one = check_frame(spec, entries(**{"a.txt": "1"}), entries(**{"a.txt": "2"}))
+    two = check_frame(spec, entries(**{"a.txt": "1", "b.txt": "1"}), entries(**{"a.txt": "2", "b.txt": "2"}))
+    assert one.verdict == "violated" and two.verdict == "verified"
 
 
 def test_change_kind_must_match():
@@ -134,6 +153,30 @@ def test_file_tree_observer_sees_add_modify_delete_and_symlinks(tmp_path):
     assert {(c.path, c.change) for c in r.observed} == {("a", "modified"), ("d/b", "deleted"), ("c", "added"),
                                                         ("link", "added")}
     assert "etc/passwd" not in str(obs.snapshot())  # the symlink is not followed
+
+
+def test_permission_changes_and_empty_directories_are_observed(tmp_path):
+    (tmp_path / "run.sh").write_text("echo hi")
+    obs = FileTreeObserver(tmp_path)
+    before = obs.snapshot()
+    os.chmod(tmp_path / "run.sh", 0o777)
+    (tmp_path / "newdir").mkdir()
+    r = check_frame(FrameSpec(), before, obs.snapshot())
+    assert {(c.path, c.change) for c in r.observed} == {("run.sh", "modified"), ("newdir/", "added")}
+    assert r.verdict == "violated"
+
+
+def test_ignored_directories_are_not_descended(tmp_path):
+    (tmp_path / "cache").mkdir()
+    obs = FileTreeObserver(tmp_path, ignore=("cache/**",))
+    before = obs.snapshot()
+    (tmp_path / "cache" / "x").write_text("1")
+    assert check_frame(FrameSpec(), before, obs.snapshot()).observed == []
+
+
+def test_mapping_observer_refuses_ambiguous_ids():
+    with pytest.raises(TypeError):
+        MappingObserver(lambda: {1: "a", "1": "b"}).snapshot()
 
 
 def test_mapping_observer():

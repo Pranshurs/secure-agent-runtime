@@ -236,7 +236,9 @@ def test_undecided_reconciliation_keeps_the_action_unknown(service, store, behav
     o = approved(rt)
     service.fail_next = "after_effect"
     rt.execute(o.key)
+    t0 = time.monotonic()
     assert rt.reconcile(o.key).state == "effect_unknown"
+    assert time.monotonic() - t0 < 0.8  # a hanging reconciler is bounded by the tool timeout
     assert rt.execute(o.key).state == "effect_unknown" and service.calls == 1
     kinds = {e.kind for e in store.events()}
     assert {"reconcile.unknown", "reconcile.result_invalid"} & kinds
@@ -275,6 +277,104 @@ def test_human_resolution_as_applied_and_as_abandoned(rt, app):
         assert out.state == ("succeeded" if applied else "failed")
         assert rt.execute(o.key).state == out.state
     assert app.invocations["write_note"] == 0
+
+
+# -- attempt fencing: nothing from attempt N decides attempt N+1 ------------------------------------ #
+
+def test_stale_reconciliation_cannot_reopen_a_later_attempt(service, store):
+    """A slow reconciler for attempt 1 answering after attempt 2 was dispatched must not
+    flip the action back to approved (which would allow attempt 3 unreconciled)."""
+    import dataclasses
+
+    rt = rf.build_runtime(service, store)
+    gate, entered = threading.Event(), threading.Event()
+    spec = rt.registry.get("refund")
+
+    def slow_recon(args, ctx):
+        if ctx.attempt == 1:
+            entered.set()
+            gate.wait(5)
+        return NotApplied()
+
+    rt.registry.replace(dataclasses.replace(spec, reconciler=slow_recon, timeout_s=5))
+    o = approved(rt)
+    service.fail_next = "before_effect"
+    assert rt.execute(o.key).state == "effect_unknown"                  # attempt 1 lost
+    result = {}
+    t = threading.Thread(target=lambda: result.setdefault("r", rt.reconcile(o.key)))
+    t.start()
+    assert entered.wait(5)
+    rt.resolve(o.key, by=rf.APPROVER, applied=False, redispatch=True)   # a human decides first
+    service.fail_next = "after_effect"
+    assert rt.execute(o.key).state == "effect_unknown"                  # attempt 2: money moved
+    gate.set()
+    t.join(5)
+    assert result["r"].state == "effect_unknown"                        # the stale answer was refused
+    assert store.events(kind="reconcile.stale")
+    assert rt.execute(o.key).state == "effect_unknown" and service.calls == 2 and len(service.refunds) == 1
+
+
+def test_late_worker_of_attempt_one_cannot_complete_attempt_two(service, store):
+    import dataclasses
+
+    rt = rf.build_runtime(service, store)
+    release1, release2, done1 = threading.Event(), threading.Event(), threading.Event()
+    spec = rt.registry.get("refund")
+
+    def tool(args, ctx):
+        if ctx.attempt == 1:
+            release1.wait(5)
+            done1.set()
+            return rf.RefundOut(refund_id="rf_late", order=args.order, amount_inr=args.amount_inr)
+        release2.wait(5)
+        rid = service.refund(args.order, args.amount_inr, idempotency_key=ctx.idempotency_key)
+        return rf.RefundOut(refund_id=rid, order=args.order, amount_inr=args.amount_inr)
+
+    rt.registry.replace(dataclasses.replace(spec, fn=tool, timeout_s=0.05))
+    o = approved(rt)
+    assert rt.execute(o.key).state == "effect_unknown"
+    release1.set()
+    assert done1.wait(5) and wait_for(lambda: store.events(kind="call.late_result_discarded"))
+    rt.resolve(o.key, by=rf.APPROVER, applied=False, redispatch=True)
+    rt.registry.replace(dataclasses.replace(spec, fn=tool, timeout_s=5))
+    t = threading.Thread(target=rt.execute, args=(o.key,))
+    t.start()
+    assert wait_for(lambda: store.get_call(o.key).state == "executing" and store.get_call(o.key).dispatches == 2)
+    assert store.get_call(o.key).state == "executing"  # attempt 1's result did not complete attempt 2
+    release2.set()
+    t.join(5)
+    row = store.get_call(o.key)
+    assert row.state == "succeeded" and row.result["refund_id"] == "rf_0001"
+
+
+def test_late_worker_finishing_mid_attempt_two_is_discarded(service, store):
+    import dataclasses
+
+    rt = rf.build_runtime(service, store)
+    release1, entered2, release2 = threading.Event(), threading.Event(), threading.Event()
+    spec = rt.registry.get("refund")
+
+    def tool(args, ctx):
+        if ctx.attempt == 1:
+            release1.wait(5)
+            return rf.RefundOut(refund_id="rf_late", order=args.order, amount_inr=args.amount_inr)
+        entered2.set()
+        release2.wait(5)
+        rid = service.refund(args.order, args.amount_inr, idempotency_key=ctx.idempotency_key)
+        return rf.RefundOut(refund_id=rid, order=args.order, amount_inr=args.amount_inr)
+
+    def recon(args, ctx):
+        return NotApplied()
+
+    rt.registry.replace(dataclasses.replace(spec, fn=tool, reconciler=recon, timeout_s=0.05))
+    o = approved(rt)
+    assert rt.execute(o.key).state == "effect_unknown"
+    assert rt.reconcile(o.key).state == "effect_unknown"  # deferred: attempt 1 still running
+    assert store.events(kind="reconcile.deferred")
+    with pytest.raises(ApprovalRefused, match="still running"):
+        rt.resolve(o.key, by=rf.APPROVER, applied=False, redispatch=True)
+    release1.set()
+    assert wait_for(lambda: store.events(kind="call.late_result_discarded"))
 
 
 # -- duplicates and idempotency keys ------------------------------------------------------------ #
@@ -358,6 +458,30 @@ def test_tool_upgrade_after_approval_blocks_dispatch(rrt, service):
     rrt.registry.replace(dataclasses.replace(rrt.registry.get("refund"), version="2026-11"))
     out = rrt.execute(o.key)
     assert out.state == "cancelled" and "changed since approval" in out.reason and service.calls == 0
+
+
+@pytest.mark.parametrize("deadline", ["tomorrow", float("nan"), float("inf"), True])
+def test_malformed_deadline_is_refused_at_proposal(rrt, deadline):
+    with pytest.raises(ValueError):
+        rrt.propose(run_id="t", principal_id=rf.AGENT, call_id="c", tool="refund", arguments=ARGS,
+                    deadline=deadline)
+    assert rrt.store.calls() == []
+
+
+def test_replay_with_a_different_deadline_is_divergence(rrt):
+    rrt.propose(run_id="t", principal_id=rf.AGENT, call_id="c", tool="refund", arguments=ARGS, deadline=1e10)
+    with pytest.raises(ReplayDivergence):
+        rrt.propose(run_id="t", principal_id=rf.AGENT, call_id="c", tool="refund", arguments=ARGS)
+
+
+def test_human_resolution_still_checks_the_frame(rrt, service):
+    o = approved(rrt)
+    service.fail_next = "after_effect"
+    rrt.execute(o.key)
+    out = rrt.resolve(o.key, by=rf.APPROVER, applied=True,
+                      result={"refund_id": "rf_0001", "order": 821, "amount_inr": 4500})
+    assert out.state == "succeeded" and out.verification == "verified"
+    assert rrt.receipt(o.key)["outcome"] == "verified"
 
 
 def test_deadline_passed_blocks_dispatch(rrt, service, clock):

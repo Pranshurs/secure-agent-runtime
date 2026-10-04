@@ -57,10 +57,12 @@ def _digest(data: bytes) -> str:
 
 
 class FileTreeObserver:
-    """Snapshots every regular file under ``root`` (paths are POSIX, relative to root).
+    """Snapshots everything under ``root``: regular files (content and permission bits),
+    directories (as ``path/``, so creating an empty one is visible) and symlinks (by
+    target text, never followed). Paths are POSIX, relative to root.
 
-    Symlinks are recorded by their target text, not followed. ``ignore`` globs are
-    skipped entirely; use it for caches, never to hide what a tool may touch.
+    ``ignore`` globs are skipped entirely; use it for caches, never to hide what a tool
+    may touch. Ownership, timestamps and extended attributes are not observed.
     """
 
     def __init__(self, root: str | os.PathLike[str], ignore: tuple[str, ...] = ()) -> None:
@@ -71,19 +73,25 @@ class FileTreeObserver:
         snap: Snapshot = {}
         for dirpath, dirnames, filenames in os.walk(self.root, followlinks=False):
             dirnames.sort()
-            for name in sorted(filenames) + sorted(d for d in dirnames if os.path.islink(
-                    os.path.join(dirpath, d))):
+            for name in sorted(filenames) + sorted(dirnames):
                 full = Path(dirpath, name)
                 rel = full.relative_to(self.root).as_posix()
-                if any(p.match(rel) for p in self._ignore):
+                if any(p.match(rel) or p.match(rel + "/") for p in self._ignore):
                     continue
+                st = full.lstat()
                 if full.is_symlink():
-                    data = b"symlink:" + os.readlink(full).encode("utf-8", "surrogateescape")
-                elif full.is_file():
-                    data = full.read_bytes()
-                else:
+                    meta, data = b"symlink:", os.readlink(full).encode("utf-8", "surrogateescape")
+                elif full.is_dir():
+                    snap[rel + "/"] = Entry(_digest(b"dir:%o" % (st.st_mode & 0o7777)))
                     continue
-                snap[rel] = Entry(_digest(data), data if len(data) <= MAX_CONTENT else None)
+                elif full.is_file():
+                    meta, data = b"file:%o:" % (st.st_mode & 0o7777), full.read_bytes()
+                else:
+                    meta, data = b"special:", b""
+                snap[rel] = Entry(_digest(meta + data), data if len(data) <= MAX_CONTENT else None)
+            dirnames[:] = [d for d in dirnames if not os.path.islink(os.path.join(dirpath, d))
+                           and not any(p.match(Path(dirpath, d).relative_to(self.root).as_posix() + "/")
+                                       for p in self._ignore)]
         return snap
 
 
@@ -96,8 +104,10 @@ class MappingObserver:
     def snapshot(self) -> Snapshot:
         snap: Snapshot = {}
         for rid, value in self.source().items():
+            if not isinstance(rid, str):
+                raise TypeError(f"resource ids must be strings, got {type(rid).__name__}")
             data = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-            snap[str(rid)] = Entry(_digest(data), data if len(data) <= MAX_CONTENT else None)
+            snap[rid] = Entry(_digest(data), data if len(data) <= MAX_CONTENT else None)
         return snap
 
 
@@ -244,14 +254,20 @@ def _contains(entry: Entry | None, needle: str | None) -> bool | None:
 
 
 def check_frame(spec: FrameSpec, before: Snapshot, after: Snapshot) -> FrameResult:
-    """Classify every observed change against the frame. First match wins: required,
-    then forbidden, then allowed; anything left over is undeclared."""
+    """Classify every observed change against the frame.
+
+    A change matching a forbidden glob is forbidden, whatever else it matches. Each
+    change can satisfy at most one requirement (the first that matches it). Changes left
+    over are allowed if they match an allowed glob, otherwise undeclared.
+    """
     changes = diff(before, after)
+    forbidden_pats = [compile_glob(g) for g in spec.forbidden]
+    forbidden = [c.path for c in changes if any(p.match(c.path) for p in forbidden_pats)]
     claimed: set[str] = set()
     req_results, unverifiable = [], False
     for r in spec.required:
         pat = compile_glob(r.path)
-        matches = [c for c in changes if pat.match(c.path) and c.change == r.change]
+        matches = [c for c in changes if c.path not in claimed and pat.match(c.path) and c.change == r.change]
         problems = []
         for c in matches:
             for needle, entry, label in ((r.before_contains, before.get(c.path), "before"),
@@ -267,15 +283,12 @@ def check_frame(spec: FrameSpec, before: Snapshot, after: Snapshot) -> FrameResu
         claimed.update(c.path for c in matches)
         req_results.append({"requirement": r.to_json(), "met": not problems, "problems": problems})
 
-    forbidden_pats = [compile_glob(g) for g in spec.forbidden]
     allowed_pats = [compile_glob(g) for g in spec.allowed]
-    forbidden, allowed, undeclared = [], [], []
+    allowed, undeclared = [], []
     for c in changes:
-        if c.path in claimed:
+        if c.path in claimed or c.path in forbidden:
             continue
-        if any(p.match(c.path) for p in forbidden_pats):
-            forbidden.append(c.path)
-        elif any(p.match(c.path) for p in allowed_pats):
+        if any(p.match(c.path) for p in allowed_pats):
             allowed.append(c.path)
         else:
             undeclared.append(c.path)

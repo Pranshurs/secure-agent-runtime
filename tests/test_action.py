@@ -41,7 +41,11 @@ def test_identical_proposals_under_one_key_are_one_action(rt):
 ])
 def test_any_argument_change_changes_the_digest(rt, change):
     base = {"title": "t", "body": "b"}
-    assert digest_of(rt, "c1", base) != digest_of(rt, "c2", {**base, **change})
+    a = rt.store.get_call(prop(rt, "c1", base).key).action
+    b = rt.store.get_call(prop(rt, "c2", {**base, **change}).key).action
+    assert a["args_digest"] != b["args_digest"]
+    assert Action.from_body(a).digest != Action.from_body({**b, "action_id": a["action_id"],
+                                                           "idempotency_key": a["idempotency_key"]}).digest
 
 
 def test_unicode_is_not_normalised_so_lookalikes_differ(rt):
@@ -67,6 +71,25 @@ def test_digest_covers_every_envelope_field(rt):
     assert set(changes) == {f.name for f in dataclasses.fields(Action)}  # nothing left uncovered
     for field, value in changes.items():
         assert dataclasses.replace(a, **{field: value}).digest != a.digest, field
+
+
+def test_output_schema_change_after_approval_blocks_dispatch(rt, app):
+    from pydantic import BaseModel, ConfigDict
+
+    o = prop(rt)
+    rt.approve(o.key, approver_id=APPROVER, action_digest=o.action_digest)
+
+    class WriteOutV2(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        title: str
+        created: bool
+        bytes_written: int = 0
+
+    spec = rt.registry.get("write_note")
+    rt.registry.replace(dataclasses.replace(spec, output_model=WriteOutV2))
+    out = rt.execute(o.key)
+    assert out.state == "cancelled" and "changed since approval" in out.reason
+    assert app.invocations["write_note"] == 0
 
 
 def test_action_round_trips_through_its_body(rt):

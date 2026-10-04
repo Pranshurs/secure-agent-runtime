@@ -109,6 +109,17 @@ def test_receipt_is_bound_to_the_audit_chain(refunded):
     assert any(p.startswith("audit chain") for p in problems)
 
 
+def test_receipt_naming_other_audit_events_fails_against_the_store(refunded):
+    from secure_agent_runtime.receipts import receipt_digest
+
+    rt, key = refunded
+    r = rt.receipt(key)
+    r["audit"]["events"][-1]["hash"] = "0" * 64  # claims an event the chain doesn't contain
+    r["digest"] = receipt_digest(r)
+    assert verify_receipt(r) == []
+    assert verify_receipt(r, store=rt.store) == [f"audit event {r['audit']['events'][-1]['seq']} is missing or differs"]
+
+
 def test_receipt_detects_a_rewritten_stored_action(refunded):
     rt, key = refunded
     r = rt.receipt(key)
@@ -153,3 +164,55 @@ def test_receipts_for_every_kind_of_ending_are_schema_valid(rt, make, outcome):
 def test_not_a_receipt():
     assert verify_receipt({"schema": "something/else"}) == ["not a sar.receipt/v1 receipt"]
     assert verify_receipt([]) == ["not a sar.receipt/v1 receipt"]
+
+
+@pytest.mark.parametrize("path,value", [
+    (("execution", "state"), "cancelled"), (("outcome",), "completed"), (("execution", "dispatches"), 2),
+    (("result", "digest"), "sha256:" + "1" * 64), (("approval",), None), (("effects", "check"), None),
+])
+def test_forged_receipt_with_recomputed_digest_fails_against_the_store(refunded, path, value):
+    from secure_agent_runtime.receipts import receipt_digest
+
+    rt, key = refunded
+    forged = rt.receipt(key)
+    target = forged
+    for p in path[:-1]:
+        target = target[p]
+    target[path[-1]] = value
+    forged["digest"] = receipt_digest(forged)
+    assert verify_receipt(forged) == []  # self-consistent...
+    assert f"{path[0]} differs from the store" in verify_receipt(forged, store=rt.store)  # ...but not true
+
+
+def test_receipt_listing_no_audit_events_fails_against_the_store(refunded):
+    from secure_agent_runtime.receipts import receipt_digest
+
+    rt, key = refunded
+    r = rt.receipt(key)
+    r["audit"]["events"] = []
+    r["digest"] = receipt_digest(r)
+    assert "receipt does not list exactly this action's audit events" in verify_receipt(r, store=rt.store)
+
+
+def test_stale_receipt_is_reported(store):
+    service = rf.PaymentService()
+    rt = rf.build_runtime(service, store)
+    o = rt.propose(run_id="t", principal_id=rf.AGENT, call_id="c", tool="refund",
+                   arguments={"order": 1, "amount_inr": 1})
+    early = rt.receipt(o.key)
+    assert early["outcome"] == "pending" and verify_receipt(early, store=store) == []
+    rt.approve(o.key, approver_id=rf.APPROVER, action_digest=o.action_digest)
+    assert verify_receipt(early, store=store) == ["stale receipt: the action changed after it was issued"]
+
+
+@pytest.mark.parametrize("mangle", [
+    lambda r: r.__setitem__("signature", {"alg": "HMAC-SHA256", "key_id": "k", "value": "é" * 64}),
+    lambda r: r.__setitem__("audit", "nope"),
+    lambda r: r["audit"].__setitem__("events", [1, 2]),
+    lambda r: r.__setitem__("idempotency_key", None),
+])
+def test_malformed_receipts_get_a_verdict_not_a_crash(refunded, mangle):
+    rt, key = refunded
+    r = rt.receipt(key, signing_key=KEY)
+    mangle(r)
+    assert verify_receipt(r, signing_key=KEY, store=rt.store)  # some problem, and no exception

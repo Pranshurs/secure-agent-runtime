@@ -230,15 +230,16 @@ def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def request_hash(tool: Any, raw_args: Any) -> str:
+def request_hash(tool: Any, raw_args: Any, extra: dict[str, Any] | None = None) -> str:
     """Identity of a *raw* proposal, used to detect replay divergence.
 
     It must work for malformed proposals too, so anything that is not plain JSON is
     hashed by its type name only. It is never used to authorise anything.
     """
-    body = plain_json({"tool": tool, "args": raw_args})
+    body = plain_json({"tool": tool, "args": raw_args, "extra": extra})
     if body is None:
-        body = canonical_json({"tool": type(tool).__name__, "unserialisable": type(raw_args).__name__})
+        body = canonical_json({"tool": type(tool).__name__, "unserialisable": type(raw_args).__name__,
+                               "extra": extra})
     return _sha256(body)
 
 

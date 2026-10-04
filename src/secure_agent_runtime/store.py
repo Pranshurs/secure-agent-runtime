@@ -244,10 +244,13 @@ class Store:
         return True
 
     def transition(self, key: str, from_state: str, to_state: str, *,
-                   event: dict[str, Any] | None = None, **fields: Any) -> bool:
+                   event: dict[str, Any] | None = None, attempt: int | None = None, **fields: Any) -> bool:
         """Compare-and-set ``state``; on success also update ``fields`` and append the event.
 
-        Returns False, changing nothing, if the call is not currently in ``from_state``.
+        Returns False, changing nothing, if the call is not currently in ``from_state`` or,
+        when ``attempt`` is given, if its dispatch count is not ``attempt``. The attempt
+        fence stops a late worker or a slow reconciler of attempt N from deciding the
+        outcome of attempt N+1.
         """
         if to_state not in TRANSITIONS.get(from_state, frozenset()):
             raise IllegalTransition(f"{from_state} -> {to_state} is not a legal transition")
@@ -264,8 +267,9 @@ class Store:
                 cols.append(f"{k}=?")
                 values.append(v)
         with self.tx() as db:
-            cur = db.execute(f"UPDATE calls SET {', '.join(cols)} WHERE key=? AND state=?",
-                             (*values, key, from_state))
+            fence, fence_args = ("", ()) if attempt is None else (" AND dispatches=?", (attempt,))
+            cur = db.execute(f"UPDATE calls SET {', '.join(cols)} WHERE key=? AND state=?{fence}",
+                             (*values, key, from_state, *fence_args))
             if cur.rowcount != 1:
                 return False
             run_id = db.execute("SELECT run_id FROM calls WHERE key=?", (key,)).fetchone()["run_id"]

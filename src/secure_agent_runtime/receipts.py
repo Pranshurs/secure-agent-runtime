@@ -106,9 +106,29 @@ def receipt_digest(receipt: dict[str, Any]) -> str:
     return sha256_text(canonical_json(unsigned))
 
 
-def verify_receipt(receipt: dict[str, Any], *, signing_key: bytes | None = None,
-                   store: Store | None = None) -> list[str]:
-    """Problems found; an empty list means the receipt verified at every level requested."""
+_NOT_SEMANTIC = frozenset({"issued_at", "receipt_id", "digest", "signature", "audit"})
+
+
+def verify_receipt(receipt: Any, *, signing_key: bytes | None = None, store: Store | None = None) -> list[str]:
+    """Problems found; an empty list means the receipt verified at every level requested.
+
+    * Always: the digest matches the content (integrity, not authorship).
+    * With ``signing_key``: an HMAC-SHA256 signature is present and valid.
+    * With ``store``: the audit chain verifies up to the receipt's chain head, the receipt
+      lists exactly the store's events for this action up to that head, and every other
+      field equals what the store says now. A receipt issued before the action changed
+      again is reported as stale.
+
+    Without a key, a receipt whose signature was stripped or left stale still passes the
+    digest check: only a key (or the store) proves who issued it.
+    """
+    try:
+        return _verify(receipt, signing_key, store)
+    except Exception as exc:  # malformed input must give a verdict, not a crash
+        return [f"malformed receipt: {type(exc).__name__}"]
+
+
+def _verify(receipt: Any, signing_key: bytes | None, store: Store | None) -> list[str]:
     problems: list[str] = []
     if not isinstance(receipt, dict) or receipt.get("schema") != RECEIPT_SCHEMA:
         return [f"not a {RECEIPT_SCHEMA} receipt"]
@@ -124,23 +144,38 @@ def verify_receipt(receipt: dict[str, Any], *, signing_key: bytes | None = None,
             problems.append("receipt is not signed with HMAC-SHA256")
         else:
             expected = hmac.new(signing_key, str(receipt.get("digest")).encode(), hashlib.sha256).hexdigest()
-            if not hmac.compare_digest(expected, str(sig.get("value"))):
+            if not hmac.compare_digest(expected.encode(), str(sig.get("value")).encode("utf-8", "replace")):
                 problems.append("signature does not verify")
-    if store is not None:
-        audit = receipt.get("audit") or {}
-        head = audit.get("chain_head") or {}
-        ok, msg = store.verify_audit(anchor=(head.get("seq", -1), head.get("hash", "")))
-        if not ok:
-            problems.append(f"audit chain: {msg}")
-        by_seq = {e.seq: e for e in store.events()}
-        for ev in audit.get("events", []):
-            stored = by_seq.get(ev.get("seq"))
-            if stored is None or stored.hash != ev.get("hash") or stored.kind != ev.get("kind"):
+    if store is None:
+        return problems
+
+    audit = receipt["audit"]
+    head = audit["chain_head"]
+    ok, msg = store.verify_audit(anchor=(head["seq"], head["hash"]))
+    if not ok:
+        problems.append(f"audit chain: {msg}")
+    key = receipt["idempotency_key"]
+    row = store.get_call(key)
+    if row is None:
+        return problems + ["action not found in store"]
+    action = receipt.get("action") or {}
+    if action and row.action_digest != action.get("digest"):
+        problems.append("stored action digest differs from the receipt")
+    stored = [e for e in store.events(run_id=row.run_id) if e.call_key == key]
+    listed = audit["events"]
+    upto = [e for e in stored if e.seq <= head["seq"]]
+    if not listed or [(e.seq, e.kind, e.hash) for e in upto] != [(e["seq"], e["kind"], e["hash"]) for e in listed]:
+        for ev in listed:
+            match = next((e for e in stored if e.seq == ev.get("seq")), None)
+            if match is None or match.hash != ev.get("hash") or match.kind != ev.get("kind"):
                 problems.append(f"audit event {ev.get('seq')} is missing or differs")
-        row = store.get_call(str(receipt.get("idempotency_key")))
-        action = receipt.get("action") or {}
-        if row is None:
-            problems.append("action not found in store")
-        elif action and row.action_digest != action.get("digest"):
-            problems.append("stored action digest differs from the receipt")
+        if not any(p.startswith("audit event") for p in problems):
+            problems.append("receipt does not list exactly this action's audit events")
+    if len(stored) > len(upto):
+        problems.append("stale receipt: the action changed after it was issued")
+        return problems
+    fresh = build_receipt(store, key)
+    for field in sorted(set(fresh) | set(receipt)):
+        if field not in _NOT_SEMANTIC and fresh.get(field) != receipt.get(field):
+            problems.append(f"{field} differs from the store")
     return problems
