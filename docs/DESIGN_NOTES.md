@@ -1,18 +1,24 @@
-# Secure Agent Runtime: preserved design state (PAUSED 2026-10-04)
+# Secure Agent Runtime: design notes
 
-Work is paused by owner priority. Resume only after Titanic, VDT, AI Process Consultant and
-the EmoNET audit are done. Nothing here is published; the repository is local only.
+Originally written 2026-10-04 while the project was paused; work resumed the same day with
+the first vertical slice. The sections below record the design and the dependency research
+behind it. For how the code works today, see the README.
 
 ## State of the code
-`src/secure_agent_runtime/` holds three first-draft modules. They are **untested and not
-yet wired together**:
-- `contracts.py`: `ToolSpec` (pydantic input and output models, a declared `Effect`,
-  timeout, idempotent flag, retries allowed only for idempotent tools), a registry, and the
-  canonical args hash.
+The first slice (the notes agent) is built and tested:
+- `contracts.py`: `ToolSpec` with pydantic input and output models (both must forbid extra
+  fields), strict JSON-mode validation, a declared `Effect`, a timeout, and the canonical
+  args hash. Retries were dropped from this slice: nothing retries, so a retry rule would be
+  untested.
 - `policy.py`: a deterministic, default-deny policy over (principal grants, argument
   constraints, effect-based approval). It never reads model text.
-- `store.py`: SQLite with compare-and-set call transitions, plus a hash-chained audit log
-  appended in the same transaction as each transition. It also persists run state.
+- `store.py`: SQLite with compare-and-set call transitions, a closed transition table, and
+  a hash-chained audit log appended in the same transaction as each transition. The draft's
+  run-state table was dropped; transcripts are in memory for now.
+- `runtime.py`: the governor (`propose`, `approve`, `reject`, `cancel`, `execute`,
+  `expire_pending`, `recover`).
+- `agent.py`: a minimal provider-neutral agent loop.
+- `examples/notes.py`: the slice itself.
 
 ## Thesis
 The model proposes; the runtime disposes. Policy decisions use only structured facts:

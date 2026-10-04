@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "secure-agent-runtime"
+version = "0.1.0"
+description = "A tool-call governor for LLM agents: the model proposes, the runtime disposes."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Pranshu Raj" }]
+requires-python = ">=3.10"
+dependencies = ["pydantic>=2.7,<3"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/secure_agent_runtime"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# Mutant definitions are literal source snippets; wrapping them hurts readability.
+"scripts/mutation_test.py" = ["E501"]
