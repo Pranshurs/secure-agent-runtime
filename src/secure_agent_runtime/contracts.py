@@ -24,7 +24,8 @@ import hashlib
 import inspect
 import json
 import math
-import pickle
+# Only pickle.dumps() is used, to check that a tool can be sent to a worker process.
+import pickle  # nosec B403
 import re
 import threading
 from collections.abc import Callable

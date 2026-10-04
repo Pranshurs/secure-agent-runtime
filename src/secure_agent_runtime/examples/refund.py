@@ -23,7 +23,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..auth import TokenAuthenticator
+from ..auth import TokenAuthenticator, demo_token
 from ..contracts import Applied, Effect, NotApplied, ToolContext, ToolRegistry
 from ..effects import FrameSpec, MappingObserver, Required
 from ..policy import Policy, Principal
@@ -212,7 +212,7 @@ def build_runtime(service: PaymentService, store: Store | None = None, *, isolat
 
 def approve_as_finance(rt: Runtime, o: Any) -> Any:
     """The finance lead approves exactly the action they were shown."""
-    token = rt.authenticator.issue(APPROVER, scope=o.action_digest)  # minted for this action only
+    token = demo_token(rt, APPROVER, scope=o.action_digest)  # minted for this action only
     return rt.approve(o.key, credential=token, action_digest=o.action_digest)
 
 
@@ -234,7 +234,7 @@ def run_sar(service: PaymentService, *, fault: str, store: Store | None = None) 
     o = rt.propose(run_id="ticket-77", principal_id=AGENT, call_id="call_1", tool="refund", arguments=args)
     trace.append(f"proposed refund(order=821, amount_inr=4500) -> {o.state}")
     approve_as_finance(rt, o)
-    trace.append(f"{APPROVER} approved action {o.action_digest[:23]}...")
+    trace.append(f"{APPROVER} approved action {(o.action_digest or '')[:23]}...")
     service.fail_next = fault
     out = rt.execute(o.key)
     trace.append(f"dispatch 1 -> {out.state.upper()} ({out.reason})")

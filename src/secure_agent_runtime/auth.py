@@ -61,6 +61,14 @@ class Authenticator(Protocol):
     def authenticate(self, credential: Any) -> AuthContext | None: ...
 
 
+def demo_token(rt: Any, principal_id: str, *, scope: str | None = None) -> str:
+    """Mint a one-time credential from a runtime that uses :class:`TokenAuthenticator`."""
+    auth = getattr(rt, "authenticator", None)
+    if not isinstance(auth, TokenAuthenticator):
+        raise TypeError("this runtime does not use the demo TokenAuthenticator")
+    return auth.issue(principal_id, scope=scope)
+
+
 class TokenAuthenticator:
     """Demo/test authenticator: ``issue(principal_id)`` returns a random one-time token.
 

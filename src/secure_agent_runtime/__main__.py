@@ -14,6 +14,7 @@ import json
 import os
 import stat
 import sys
+from typing import Any
 
 MAX_RECEIPT_BYTES = 4 * 1024 * 1024
 
@@ -57,7 +58,7 @@ def main(argv: list[str] | None = None) -> int:
 
         # Exit codes: 0 verified, 1 the receipt failed verification, 2 could not check.
         try:
-            receipt = _read_receipt(ns.file)
+            receipt: Any = _read_receipt(ns.file)
         except (OSError, ValueError, RecursionError) as exc:
             print(f"ERROR: cannot read receipt: {exc}", file=sys.stderr)
             return 2

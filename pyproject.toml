@@ -12,10 +12,17 @@ license-files = ["LICENSE"]
 authors = [{ name = "Pranshu Raj" }]
 requires-python = ">=3.10"
 dependencies = ["pydantic>=2.7,<3"]
+urls = { Source = "https://github.com/Pranshurs/secure-agent-runtime" }
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Programming Language :: Python :: 3",
     "Topic :: Security",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
 
 [project.scripts]
@@ -33,6 +40,21 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/secure_agent_runtime"]
+
+[tool.hatch.build.targets.sdist]
+# What a user needs to build, test and audit the package; not repo tooling or AI notes.
+include = ["src/", "tests/", "scripts/", "docs/", "README.md", "CONTRIBUTING.md", "LICENSE", "pyproject.toml"]
+exclude = ["**/__pycache__", "**/*.pyc"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src"]
+warn_unused_ignores = true
+
+[tool.bandit]
+# B101: asserts are used only for type narrowing after explicit checks.
+# B608: the only f-string SQL builds column lists from a fixed whitelist (store._UPDATABLE).
+skips = ["B101", "B608"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

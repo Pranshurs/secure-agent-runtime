@@ -277,7 +277,7 @@ class Store:
 
     def events(self, run_id: str | None = None, kind: str | None = None,
                call_key: str | None = None) -> list[Event]:
-        q, p = "SELECT * FROM events WHERE 1=1", []
+        q, p = "SELECT * FROM events WHERE 1=1", list[Any]()
         if call_key is not None:
             q, p = q + " AND call_key=?", p + [call_key]
         if run_id is not None:
@@ -398,7 +398,7 @@ class Store:
         return _row(r) if r else None
 
     def calls(self, *, run_id: str | None = None, state: str | None = None) -> list[CallRow]:
-        q, p = "SELECT * FROM calls WHERE 1=1", []
+        q, p = "SELECT * FROM calls WHERE 1=1", list[Any]()
         if run_id is not None:
             q, p = q + " AND run_id=?", p + [run_id]
         if state is not None:

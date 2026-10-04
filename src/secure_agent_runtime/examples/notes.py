@@ -19,7 +19,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..auth import TokenAuthenticator
+from ..auth import TokenAuthenticator, demo_token
 from ..contracts import Effect, ToolRegistry
 from ..policy import Policy, Principal
 from ..runtime import Runtime
@@ -167,8 +167,9 @@ def _demo() -> None:  # pragma: no cover - illustrative
     for key in res.pending:
         row = rt.store.get_call(key)
         assert row is not None
+        assert row.action_digest is not None
         print(f"alice approves {row.tool} {row.args} (action {row.action_digest[:19]}...)")
-        token = rt.authenticator.issue(APPROVER, scope=row.action_digest)  # alice signs in, sees this action
+        token = demo_token(rt, APPROVER, scope=row.action_digest)  # alice signs in, sees this action
         rt.approve(key, credential=token, action_digest=row.action_digest)
     res = agent.resume("run-1")
     for o in res.outcomes:

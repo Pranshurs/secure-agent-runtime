@@ -23,7 +23,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..auth import TokenAuthenticator
+from ..auth import TokenAuthenticator, demo_token
 from ..contracts import Effect, ToolRegistry
 from ..effects import FileTreeObserver, FrameSpec, Required
 from ..policy import Policy, Principal
@@ -109,8 +109,8 @@ def run(agent: Callable[[Path, BumpIn], list[str]], root: Path, store: Store | N
     rt = build_runtime(make_workspace(root), agent, store)
     o = rt.propose(run_id="release", principal_id=AGENT, call_id="bump", tool="bump_version",
                    arguments={"from_version": "2.1.0", "to_version": "2.1.1"})
-    rt.approve(o.key, credential=rt.authenticator.issue(APPROVER, scope=o.action_digest),
-               action_digest=o.action_digest)
+    assert o.action_digest is not None
+    rt.approve(o.key, credential=demo_token(rt, APPROVER, scope=o.action_digest), action_digest=o.action_digest)
     rt.execute(o.key)
     return rt, o.key
 
