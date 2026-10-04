@@ -409,3 +409,72 @@ def test_lock_contention_fails_closed_with_a_store_error(tmp_path, clock):
         other.close()
     assert s.get_call(o.key).state == "approved" and app.invocations["read_note"] == 0
     assert rt.execute(o.key).state == "succeeded" and s.verify_audit()[0]
+
+
+# -- S1 (stress harness): the in-memory worker map is shared by every calling thread ----------------- #
+
+def test_s1_worker_map_survives_concurrent_release_during_iteration(rt):
+    """Deterministic version of the race: while execute() walks the map of running workers,
+    another thread releases one of them. Without the lock this raised
+    'dictionary changed size during iteration' out of execute()."""
+    release = getattr(rt, "_release_worker", None)
+
+    class Finished:
+        def is_alive(self):
+            return False
+
+    class Racing:
+        def is_alive(self):
+            def other_thread():
+                if release is not None:
+                    release("k2", finished)
+                else:  # pre-fix code had no release helper
+                    rt._live.pop("k2", None)
+            t = threading.Thread(target=other_thread)
+            t.start()
+            t.join(0.2)  # with the lock held by execute(), this thread waits; that's the fix
+            return True
+
+    finished = Finished()
+    rt._live.update({"k1": Racing(), "k2": finished, "k3": Finished()})
+    o = rt.propose(run_id="r", principal_id=AGENT, call_id="c", tool="read_note", arguments={"title": "todo"})
+    assert rt.execute(o.key).state == "succeeded"
+
+
+def test_s1_concurrent_executes_never_raise(store):
+    from pydantic import BaseModel, ConfigDict
+
+    from secure_agent_runtime.contracts import Effect, ToolRegistry
+    from secure_agent_runtime.policy import Policy, Principal
+    from secure_agent_runtime.runtime import Runtime
+
+    class M(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        n: int
+
+    def slowish(args):  # outlives its timeout, so workers stay registered while others come and go
+        threading.Event().wait(0.02)
+        return args
+
+    reg = ToolRegistry()
+    reg.tool(name="t", input=M, output=M, effect=Effect.READ, timeout_s=0.005)(slowish)
+    rt = Runtime(registry=reg, policy=Policy(), store=store, max_stuck_workers=10_000,
+                 principals=[Principal("p", grants=frozenset({"t"}))])
+    keys = [rt.propose(run_id="r", principal_id="p", call_id=f"c{i}", tool="t", arguments={"n": i}).key
+            for i in range(400)]
+    errors: list[BaseException] = []
+
+    def go(chunk):
+        for k in chunk:
+            try:
+                rt.execute(k)
+            except BaseException as exc:  # noqa: BLE001 - any exception here is the bug
+                errors.append(exc)
+
+    threads = [threading.Thread(target=go, args=(keys[i::16],)) for i in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    assert errors == []
+    assert {store.get_call(k).state for k in keys} <= {"succeeded", "failed"}

@@ -119,6 +119,7 @@ def run_round(seed: int, n_actions: int, n_threads: int, round_no: int) -> dict[
                                                              "fault": fault, "delay_ms": delay},
                       "dupes": rng.randint(1, 3), "cancel": rng.random() < 0.05})
     keys: dict[str, str] = {}
+    unexpected: list[str] = []
 
     def count(name: str) -> None:
         with lock:
@@ -135,6 +136,9 @@ def run_round(seed: int, n_actions: int, n_threads: int, round_no: int) -> dict[
             count("divergence")
         except StoreError:
             count("store_errors")
+        except Exception as exc:
+            with lock:
+                unexpected.append(f"{type(exc).__name__}: {exc}")
 
     def worker(p: dict[str, Any]) -> None:
         key = keys.get(p["call"])
@@ -157,6 +161,9 @@ def run_round(seed: int, n_actions: int, n_threads: int, round_no: int) -> dict[
             count("store_errors")
         except SARError:
             count("sar_errors")
+        except Exception as exc:  # any other exception from the public API is a bug
+            with lock:
+                unexpected.append(f"{type(exc).__name__}: {exc}")
 
     t0 = time.monotonic()
     threads = []
@@ -219,14 +226,16 @@ def run_round(seed: int, n_actions: int, n_threads: int, round_no: int) -> dict[
         failures.append(f"claims {claims} < provider calls {ledger.calls}")
     if deadlocks:
         failures.append(f"{deadlocks} worker threads did not finish (deadlock?)")
+    if unexpected:
+        failures.append(f"{len(unexpected)} unexpected exceptions from the public API, e.g. {unexpected[0]}")
     late = len(store.events(kind="call.late_result_discarded"))
     store.close()
     return {"seed": seed, "round": round_no, "actions": n_actions, "threads": n_threads,
             "proposals": stats["proposals"], "duplicates_absorbed": stats["proposals"] - n_actions,
             "claims": claims, "provider_calls": ledger.calls, "effects": sum(refunds.values()),
             "late_results_discarded": late,
-            "store_errors": stats["store_errors"], "states": {k[6:]: v for k, v in stats.items()
-                                                              if k.startswith("state:")},
+            "store_errors": stats["store_errors"], "unexpected_exceptions": len(unexpected),
+            "states": {k[6:]: v for k, v in stats.items() if k.startswith("state:")},
             "seconds": round(elapsed, 2), "failures": failures}
 
 

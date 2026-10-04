@@ -24,7 +24,6 @@ import hashlib
 import inspect
 import json
 import math
-# Only pickle.dumps() is used, to check that a tool can be sent to a worker process.
 import pickle  # nosec B403
 import re
 import threading
@@ -141,7 +140,7 @@ class ToolSpec:
         if self.isolation == "process":
             for label, obj in (("fn", self.fn), ("input model", self.input_model),
                                ("output model", self.output_model)):
-                try:
+                try:  # only dumps(): can this be sent to a worker process by reference?
                     pickle.dumps(obj)
                 except Exception as exc:
                     raise ContractError(f"{self.name}: process isolation needs an importable {label} "

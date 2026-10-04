@@ -195,3 +195,34 @@ def test_process_isolation_requires_importable_tools():
 
     with pytest.raises(ContractError, match="importable"):
         ToolRegistry().tool(name="t", input=M, output=M, effect=Effect.WRITE, isolation="process")(lambda a: M())
+
+
+# -- every way a worker can end, in process mode ------------------------------------------------- #
+
+@pytest.mark.parametrize("mode,effect,expected,reason", [
+    ("ok", "external", "succeeded", ""),
+    ("exit", "external", "effect_unknown", "worker process died"),
+    ("raise", "external", "effect_unknown", "tool raised RuntimeError"),
+    ("not_applied", "external", "failed", "not applied"),
+    ("unserialisable", "external", "effect_unknown", "invalid output"),
+    ("invalid", "external", "effect_unknown", "invalid output"),
+    ("exit", "read", "failed", "worker process died"),
+    ("invalid", "read", "output_rejected", "invalid output"),
+])
+def test_worker_outcomes_in_process_mode(store, mode, effect, expected, reason):
+    from secure_agent_runtime.auth import TokenAuthenticator
+    from secure_agent_runtime.contracts import Effect, ToolRegistry
+    from secure_agent_runtime.policy import Policy, Principal
+    from secure_agent_runtime.runtime import Runtime
+
+    from . import process_tools as pt
+
+    reg = ToolRegistry()
+    reg.tool(name="t", input=pt.In, output=pt.Out, effect=Effect(effect), isolation="process", timeout_s=20)(pt.tool)
+    rt = Runtime(registry=reg, policy=Policy(require_approval_for_effects=frozenset()), store=store,
+                 authenticator=TokenAuthenticator(), principals=[Principal("p", grants=frozenset({"t"}))])
+    o = rt.propose(run_id="r", principal_id="p", call_id="c", tool="t", arguments={"mode": mode})
+    out = rt.execute(o.key)
+    assert out.state == expected and reason in out.reason
+    assert "secret detail" not in str([e.data for e in store.events()])
+    assert rt.execute(o.key).state == expected  # nothing re-dispatches on its own

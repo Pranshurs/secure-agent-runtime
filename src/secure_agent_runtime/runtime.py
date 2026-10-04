@@ -149,6 +149,7 @@ class Runtime:
         self._faults = faults or (lambda point, key: None)
         self._before: dict[str, tuple[int, Snapshot]] = {}  # key -> (attempt, pre-dispatch snapshot)
         self._live: dict[str, Any] = {}  # key -> worker (thread or process) of the latest dispatch
+        self._mem = threading.Lock()  # guards _before and _live, shared by every calling thread
         self._principals: dict[str, Principal] = {}
         for p in principals:
             if p.id in self._principals or p.id == POLICY_APPROVER:
@@ -429,11 +430,11 @@ class Runtime:
                                   reason=f"blocked at execution: {problem}")
             return Outcome.of(self._get(key))
         assert spec is not None and model is not None and action is not None
-        stuck = [k for k, w in self._live.items() if w.is_alive()]
-        if len(stuck) >= self.max_stuck_workers:
+        stuck = self._stuck_workers()
+        if stuck >= self.max_stuck_workers:
             # Timed-out tools that ignore cancellation still hold threads; don't pile up more.
-            self.store.record(row.run_id, "dispatch.throttled", {"live_workers": len(stuck)}, call_key=key)
-            log.warning("not dispatching %s: %d workers from earlier dispatches are still running", key, len(stuck))
+            self.store.record(row.run_id, "dispatch.throttled", {"live_workers": stuck}, call_key=key)
+            log.warning("not dispatching %s: %d workers from earlier dispatches are still running", key, stuck)
             return Outcome.of(row)
 
         before: Snapshot | None = None
@@ -454,7 +455,8 @@ class Runtime:
                                      event={"action_digest": row.action_digest, "attempt": attempt}):
             return Outcome.of(self._get(key))
         if before is not None:
-            self._before[key] = (attempt, before)
+            with self._mem:
+                self._before[key] = (attempt, before)
         self._faults("after_claim", key)
 
         effectful = _effectful(spec)
@@ -474,7 +476,7 @@ class Runtime:
                     ok = self.store.transition(key, "executing", fallback, attempt=attempt,
                                                reason=f"result could not be recorded ({type(exc).__name__})")
                 if ok:
-                    self._before.pop(key, None)
+                    self._forget_snapshot(key)
                     if state == "effect_unknown":
                         log.warning("action %s: effect unknown (%s)", key, fields.get("reason", ""))
                 else:
@@ -509,7 +511,8 @@ class Runtime:
             return Outcome.of(self._get(key))
 
         worker = threading.Thread(target=work, name=f"sar-tool-{spec.name}", daemon=True)
-        self._live[key] = worker
+        with self._mem:
+            self._live[key] = worker
         worker.start()
         worker.join(spec.timeout_s)
         if worker.is_alive():
@@ -518,7 +521,7 @@ class Runtime:
                                      attempt=attempt, reason=f"no result within {spec.timeout_s}s"):
                 log.warning("action %s timed out; the worker thread cannot be killed and may still act", key)
         else:
-            self._live.pop(key, None)
+            self._release_worker(key, worker)
         return Outcome.of(self._get(key))
 
     def _dispatch_in_process(self, spec: ToolSpec, model: BaseModel, action: Action, key: str, attempt: int,
@@ -536,10 +539,11 @@ class Runtime:
         worker = Worker(token, spec.fn, spec.input_model, canonical_json(model.model_dump(mode="json")),
                         {"action_id": action.action_id, "idempotency_key": key, "attempt": attempt},
                         spec.takes_ctx)
-        self._live[key] = worker
+        with self._mem:
+            self._live[key] = worker
         self._faults("after_spawn", key)
         res = worker.wait(spec.timeout_s)
-        self._live.pop(key, None)
+        self._release_worker(key, worker)
         self._faults("after_effect", key)
         unknown = "effect_unknown" if effectful else "failed"
         if res.kind == "ok":
@@ -570,7 +574,8 @@ class Runtime:
     def _frame_result(self, spec: ToolSpec, action: Action, key: str, attempt: int) -> dict[str, Any] | None:
         if spec.observer is None or action.frame is None:
             return None
-        cached = self._before.get(key)
+        with self._mem:
+            cached = self._before.get(key)
         before = cached[1] if cached is not None and cached[0] == attempt else None
         if before is None:
             row = self.store.get_call(key)
@@ -628,6 +633,28 @@ class Runtime:
                 return (f"approval no longer valid: {refusal}", *none)
         return None, spec, model, current
 
+    # -- in-memory bookkeeping (thread-safe) ----------------------------------- #
+    def _stuck_workers(self) -> int:
+        """Workers still running; dead ones are pruned so the map can't grow without bound."""
+        with self._mem:
+            for k in [k for k, w in self._live.items() if not w.is_alive()]:
+                del self._live[k]
+            return len(self._live)
+
+    def _release_worker(self, key: str, worker: Any) -> None:
+        with self._mem:
+            if self._live.get(key) is worker:  # never evict a newer attempt's worker
+                del self._live[key]
+
+    def _worker_alive(self, key: str) -> bool:
+        with self._mem:
+            worker = self._live.get(key)
+        return worker is not None and worker.is_alive()
+
+    def _forget_snapshot(self, key: str) -> None:
+        with self._mem:
+            self._before.pop(key, None)
+
     def _approval_is_audited(self, row: CallRow) -> bool:
         """The latest ``call.approved`` event must carry this exact approval record's digest."""
         latest = None
@@ -657,8 +684,7 @@ class Runtime:
             self.store.record(row.run_id, "reconcile.unavailable", {"why": "args no longer validate"},
                               call_key=key)
             return Outcome.of(row)
-        worker = self._live.get(key)
-        if worker is not None and worker.is_alive():
+        if self._worker_alive(key):
             # The timed-out dispatch is still running here and could yet act; asking now
             # could get "not applied" just before it applies. Wait for it to finish.
             self.store.record(row.run_id, "reconcile.deferred", {"why": "dispatch still running"}, call_key=key)
@@ -681,7 +707,7 @@ class Runtime:
                                          event={"reconciled": "applied", "attempt": attempt}):
                 self.store.record(row.run_id, "reconcile.stale", {"attempt": attempt}, call_key=key)
             else:
-                self._before.pop(key, None)
+                self._forget_snapshot(key)
                 log.info("action %s reconciled: applied", key)
         elif isinstance(finding, NotApplied):
             if not self.store.transition(key, "effect_unknown", "approved", attempt=attempt,
@@ -690,7 +716,7 @@ class Runtime:
                                                 "approval_digest": approval_digest(row.approval or {})}):
                 self.store.record(row.run_id, "reconcile.stale", {"attempt": attempt}, call_key=key)
             else:
-                self._before.pop(key, None)
+                self._forget_snapshot(key)
                 log.info("action %s reconciled: not applied; it may be dispatched again", key)
         else:
             why = finding.reason if isinstance(finding, Unknown) else f"reconciler returned {type(finding).__name__}"
@@ -716,8 +742,7 @@ class Runtime:
             raise ApprovalRefused(refusal)
         assert isinstance(ctx, AuthContext)
         by = ctx.subject
-        worker = self._live.get(key)
-        if worker is not None and worker.is_alive():
+        if self._worker_alive(key):
             raise ApprovalRefused("the last dispatch is still running; resolve after it finishes")
         spec = self.registry.get(row.tool)
         attempt = row.dispatches
@@ -760,7 +785,7 @@ class Runtime:
                 raise ApprovalRefused("this approval credential has already been used") from None
         if not ok:
             raise ApprovalRefused("the action changed while it was being resolved")
-        self._before.pop(key, None)
+        self._forget_snapshot(key)
         return Outcome.of(self._get(key))
 
     # -- recovery ----------------------------------------------------------------- #
