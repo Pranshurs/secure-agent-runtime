@@ -68,6 +68,25 @@ def test_verify_receipt_cli(receipt_file):
     assert cli("verify-receipt", str(receipt_file), "--key-env", "NOPE_UNSET").returncode == 2
 
 
+def test_verify_receipt_cli_refuses_unusable_keys_as_could_not_check(receipt_file):
+    """A key that can't be used means the receipt wasn't checked (exit 2), not that it failed."""
+    short = cli("verify-receipt", str(receipt_file), "--key-env", "SAR_KEY", env={"SAR_KEY": "short"})
+    assert short.returncode == 2 and "shorter than" in short.stderr
+    for bad in ("k=abcd", "k=" + "00" * 31, "k=zz"):
+        assert cli("verify-receipt", str(receipt_file), "--public-key", bad).returncode == 2
+
+
+def test_verify_receipt_cli_rejects_a_self_consistent_stub(tmp_path):
+    from secure_agent_runtime.receipts import receipt_digest
+
+    stub = {"schema": "sar.receipt/v1", "receipt_id": "x", "outcome": "verified"}
+    stub["digest"] = receipt_digest(stub)
+    path = tmp_path / "stub.json"
+    path.write_text(json.dumps(stub))
+    p = cli("verify-receipt", str(path))
+    assert p.returncode == 1 and "lacks required fields" in p.stdout and "Traceback" not in p.stderr
+
+
 def test_schema_cli():
     p = cli("schema")
     assert p.returncode == 0 and json.loads(p.stdout)["title"] == "SAR Agent Receipt v1"

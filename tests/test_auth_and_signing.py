@@ -212,7 +212,8 @@ def test_ed25519_algorithm_confusion_fails(signed):
     rt, o, signer, keys, r = signed
     forged = copy.deepcopy(r)
     forged["signature"]["alg"] = "HMAC-SHA256"
-    assert verify_receipt(forged, signing_key=keys["ops-2026-10"] * 2) == ["signature does not verify"]
+    assert verify_receipt(forged, signing_key=keys["ops-2026-10"] * 2) == [  # an Ed25519 value is not an HMAC
+        "signature value is not in canonical form (lowercase hex)"]
     forged["signature"]["alg"] = "none"
     assert verify_receipt(forged, public_keys=keys) == ["unsupported signature algorithm 'none'"]
 
@@ -245,6 +246,17 @@ def test_events_that_change_nothing_do_not_make_a_receipt_stale(store):
     rf.approve_as_finance(rt, o)  # a real change still makes it stale
     assert verify_receipt(receipt, expect_key=o.key, store=store) == [
         "stale receipt: the action changed after it was issued"]
+
+
+@pytest.mark.parametrize("alter", [
+    lambda sig: {**sig, "value": sig["value"].upper()},
+    lambda sig: {**sig, "value": sig["value"][:64] + " " + sig["value"][64:]},
+    lambda sig: {**sig, "note": "unsigned extra field"},
+], ids=["uppercase-hex", "whitespace-in-hex", "extra-field"])
+def test_a_signature_verifies_only_in_its_one_canonical_form(signed, alter):
+    rt, o, signer, keys, receipt = signed
+    forged = {**receipt, "signature": alter(receipt["signature"])}
+    assert verify_receipt(forged, public_keys=keys, expect_key=o.key, store=rt.store) != []
 
 
 def test_receipt_copied_to_another_action_fails(signed):

@@ -55,6 +55,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if ns.cmd == "verify-receipt":
         from .receipts import verify_receipt
+        from .signing import MIN_HMAC_KEY
 
         # Exit codes: 0 verified, 1 the receipt failed verification, 2 could not check.
         try:
@@ -68,13 +69,19 @@ def main(argv: list[str] | None = None) -> int:
             if not value:
                 print(f"ERROR: environment variable {ns.key_env} is not set", file=sys.stderr)
                 return 2
+            if len(value.encode()) < MIN_HMAC_KEY:  # an unusable key: we could not check, not "it failed"
+                print(f"ERROR: the HMAC key in {ns.key_env} is shorter than {MIN_HMAC_KEY} bytes", file=sys.stderr)
+                return 2
             kwargs["signing_key"] = value.encode()
         if ns.public_key:
             try:
                 key_id, hexkey = ns.public_key.split("=", 1)
-                kwargs["public_keys"] = {key_id: bytes.fromhex(hexkey)}
+                raw = bytes.fromhex(hexkey)
+                if len(raw) != 32:
+                    raise ValueError("an Ed25519 public key is 32 bytes")
+                kwargs["public_keys"] = {key_id: raw}
             except ValueError:
-                print("ERROR: --public-key must be KEY_ID=HEX", file=sys.stderr)
+                print("ERROR: --public-key must be KEY_ID=HEX with a 32-byte Ed25519 public key", file=sys.stderr)
                 return 2
         problems = verify_receipt(receipt, **kwargs)  # type: ignore[arg-type]
         if problems:
@@ -82,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"FAIL: {p}")
             return 1
         signed = "signing_key" in kwargs or "public_keys" in kwargs
-        print(f"OK: {receipt['receipt_id']} outcome={receipt['outcome']}"
+        print(f"OK: {receipt.get('receipt_id')} outcome={receipt.get('outcome')}"
               + (" (signature verified)" if signed else " (digest only; pass --public-key or --key-env to "
                                                         "check who signed it)"))
         return 0

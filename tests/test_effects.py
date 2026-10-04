@@ -343,3 +343,26 @@ def test_an_unreadable_directory_makes_the_snapshot_fail(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "scandir", deny)  # what os.walk sees for a directory it can't read
     with pytest.raises(PermissionError):
         FileTreeObserver(tmp_path).snapshot()
+
+
+def test_a_declared_frame_that_can_no_longer_be_observed_is_unverifiable_not_completed(tmp_path, store):
+    """'completed' means no frame was declared. Here one was, the outcome became unknown, and
+    the tool was redeployed without its observer and frame before a person resolved it. The
+    receipt must not say 'completed'."""
+    ws = vb.make_workspace(tmp_path / "ws")
+
+    def lost(root, args):
+        vb.careful_agent(root, args)
+        raise ConnectionError("response lost")
+
+    rt = vb.build_runtime(ws, lost, store)
+    o = rt.propose(run_id="r", principal_id=vb.AGENT, call_id="c", tool="bump_version",
+                   arguments={"from_version": "2.1.0", "to_version": "2.1.1"})
+    rt.approve(o.key, credential=cred(rt, vb.APPROVER), action_digest=o.action_digest)
+    assert rt.execute(o.key).state == "effect_unknown"
+    spec = rt.registry.get("bump_version")
+    rt.registry.replace(dataclasses.replace(spec, observer=None, frame=None))
+    out = rt.resolve(o.key, credential=cred(rt, vb.APPROVER), applied=True,
+                     result={"files_written": ["pyproject.toml"]})
+    assert out.state == "succeeded" and out.verification == "unverifiable"
+    assert rt.receipt(o.key)["outcome"] == "unverifiable"

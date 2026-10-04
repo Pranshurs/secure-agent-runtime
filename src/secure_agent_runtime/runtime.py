@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import threading
 import time
 from collections.abc import Callable, Iterable
@@ -116,6 +117,27 @@ def _effectful(spec: ToolSpec | None) -> bool:
     return spec is None or spec.effect is not Effect.READ
 
 
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+MAX_REASON = 500
+
+
+def _finite(x: float) -> bool:
+    try:
+        return math.isfinite(float(x))
+    except OverflowError:  # an int too large for a float
+        return False
+
+
+def _is_digest(value: Any) -> bool:
+    return isinstance(value, str) and _DIGEST.fullmatch(value) is not None
+
+
+def _caller_text(value: Any) -> str:
+    """A caller-supplied reason, made safe to store: text, valid UTF-8, bounded."""
+    text = value if isinstance(value, str) else type(value).__name__
+    return text.encode("utf-8", "replace").decode("utf-8")[:MAX_REASON]
+
+
 _UNVERIFIABLE = {"verdict": "unverifiable", "observed": [], "required": [], "allowed": [],
                  "undeclared": [], "forbidden": []}
 
@@ -140,8 +162,10 @@ class Runtime:
         ``owns_store`` says who closes ``store``. A store you pass in stays yours (the
         default); a factory that creates the store itself passes ``owns_store=True`` so that
         :meth:`close` closes it, as does a constructor that fails."""
-        if approval_ttl_s <= 0:
-            raise ValueError("approval_ttl_s must be positive")
+        if (isinstance(approval_ttl_s, bool) or not isinstance(approval_ttl_s, (int, float))
+                or not _finite(approval_ttl_s) or approval_ttl_s <= 0):
+            raise ValueError("approval_ttl_s must be a positive, finite number of seconds")
+        self.closed = False
         self.owns_store = owns_store
         try:
             store.attach(self)
@@ -189,9 +213,14 @@ class Runtime:
     def close(self) -> None:
         """Release the store for another Runtime. The store is closed too only if this
         Runtime owns it (``owns_store=True``); a store passed in stays open for its owner."""
+        self.closed = True
         self.store.detach(self)
         if self.owns_store:
             self.store.close()
+
+    def _ensure_open(self) -> None:
+        if self.closed:
+            raise SARError("this Runtime is closed")
 
     def __enter__(self) -> Runtime:
         return self
@@ -206,6 +235,7 @@ class Runtime:
     def propose(self, *, run_id: str, principal_id: str, call_id: Any, tool: Any, arguments: Any,
                 idempotency_key: str | None = None, deadline: float | None = None) -> Outcome:
         """Turn a proposal into a recorded action (see :meth:`_propose`)."""
+        self._ensure_open()
         with self.telemetry.span("sar.propose", **{"sar.run_id": run_id if isinstance(run_id, str) else None}) as sp:
             o = self._propose(run_id=run_id, principal_id=principal_id, call_id=call_id, tool=tool,
                               arguments=arguments, idempotency_key=idempotency_key, deadline=deadline)
@@ -214,12 +244,14 @@ class Runtime:
 
     def approve(self, key: str, *, credential: Any, action_digest: str) -> Outcome:
         """Approve exactly the action whose digest the approver was shown (see :meth:`_approve`)."""
+        self._ensure_open()
         with self.telemetry.span("sar.approve", **{"sar.action_id": action_id_for(key)}) as sp:
             o = self._approve(key, credential=credential, action_digest=action_digest)
             self._observe(sp, o)
             return o
 
     def reject(self, key: str, *, credential: Any, reason: str = "") -> Outcome:
+        self._ensure_open()
         with self.telemetry.span("sar.reject", **{"sar.action_id": action_id_for(key)}) as sp:
             o = self._reject(key, credential=credential, reason=reason)
             self._observe(sp, o)
@@ -227,6 +259,7 @@ class Runtime:
 
     def cancel(self, key: str, *, reason: str = "cancelled") -> Outcome:
         """Cancel (or revoke the approval of) an action that has not been dispatched."""
+        self._ensure_open()
         with self.telemetry.span("sar.cancel", **{"sar.action_id": action_id_for(key)}) as sp:
             o = self._cancel(key, reason=reason)
             self._observe(sp, o)
@@ -234,6 +267,7 @@ class Runtime:
 
     def execute(self, key: str) -> Outcome:
         """Dispatch an approved action; any other state returns the stored outcome (see :meth:`_execute`)."""
+        self._ensure_open()
         row = self._get(key)
         spec = self.registry.get(row.tool)
         attrs = {"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": row.tool, "sar.tool": row.tool,
@@ -249,6 +283,7 @@ class Runtime:
 
     def reconcile(self, key: str) -> Outcome:
         """Settle an ``effect_unknown`` action through the tool's reconciler (see :meth:`_reconcile`)."""
+        self._ensure_open()
         with self.telemetry.span("sar.reconcile", **{"sar.action_id": action_id_for(key)}) as sp:
             o = self._reconcile(key)
             self._observe(sp, o)
@@ -258,6 +293,7 @@ class Runtime:
     def resolve(self, key: str, *, credential: Any, applied: bool, result: Any = None,
                 redispatch: bool = False) -> Outcome:
         """A human's verdict on an ``effect_unknown`` action (see :meth:`_resolve`)."""
+        self._ensure_open()
         with self.telemetry.span("sar.resolve", **{"sar.action_id": action_id_for(key)}) as sp:
             o = self._resolve(key, credential=credential, applied=applied, result=result, redispatch=redispatch)
             self._observe(sp, o)
@@ -286,7 +322,7 @@ class Runtime:
             raise MalformedProposal("idempotency_key must be a non-empty UTF-8 string")
         key = call_key(run_id, call_id) if idempotency_key is None else canonical_json({"key": idempotency_key})
         if deadline is not None and (isinstance(deadline, bool) or not isinstance(deadline, (int, float))
-                                     or not math.isfinite(deadline)):
+                                     or not _finite(deadline)):
             raise ValueError("deadline must be a finite number (seconds since the epoch) or None")
         deadline = None if deadline is None else float(deadline)
         rh = request_hash(tool, arguments, {"deadline": deadline})
@@ -380,6 +416,8 @@ class Runtime:
         return ctx
 
     def _refuse(self, row: CallRow, reason: str, **data: Any) -> ApprovalRefused:
+        if "action_digest" in data and not _is_digest(data["action_digest"]):
+            data["action_digest"] = None  # never log caller garbage (huge, non-JSON or non-text)
         self.store.record(row.run_id, "approval.refused", {"reason": reason, **data}, call_key=row.key)
         return ApprovalRefused(reason)
 
@@ -390,6 +428,9 @@ class Runtime:
         resulting identity, not any string the caller supplies, is the approver.
         """
         row = self._get(key)
+        if not _is_digest(action_digest):
+            raise self._refuse(row, "action_digest must be the 'sha256:...' digest the approver was shown",
+                               action_digest=action_digest)
         ctx = self._authenticate(credential, row.action_digest)
         if isinstance(ctx, str):
             raise self._refuse(row, ctx, action_digest=action_digest)
@@ -420,7 +461,7 @@ class Runtime:
         refusal = self._approval_problem(row, ctx.subject)
         if refusal is not None:
             raise self._refuse(row, refusal, approver=ctx.subject)
-        if not self.store.transition(key, "awaiting_approval", "rejected", reason=reason or "rejected",
+        if not self.store.transition(key, "awaiting_approval", "rejected", reason=_caller_text(reason) or "rejected",
                                      consume_credential=ctx.record()["credential"],
                                      event={"approver": ctx.subject}):
             raise self._refuse(row, "action is no longer awaiting approval", approver=ctx.subject)
@@ -435,6 +476,7 @@ class Runtime:
         return approval_refusal(self._principals.get(approver_id), row.principal)
 
     def expire_pending(self) -> list[str]:
+        self._ensure_open()
         now, expired = self.store.now(), []
         for row in self.store.calls(state="awaiting_approval"):
             if row.expires_at is not None and now >= row.expires_at and self.store.transition(
@@ -446,7 +488,7 @@ class Runtime:
         """Cancel (or revoke the approval of) an action that has not been dispatched."""
         row = self._get(key)
         if row.state in ("awaiting_approval", "approved"):
-            self.store.transition(key, row.state, "cancelled", reason=reason)
+            self.store.transition(key, row.state, "cancelled", reason=_caller_text(reason) or "cancelled")
         return Outcome.of(self._get(key))
 
     # -- execution ---------------------------------------------------------------- #
@@ -626,8 +668,10 @@ class Runtime:
         log.warning("action %s: could not start a worker (%s)", key, type(exc).__name__)
 
     def _frame_result(self, spec: ToolSpec, action: Action, key: str, attempt: int) -> dict[str, Any] | None:
-        if spec.observer is None or action.frame is None:
-            return None
+        if action.frame is None:
+            return None  # nothing was declared, so there is nothing to check
+        if spec.observer is None:  # declared, but the tool as registered now can't observe it
+            return {**_UNVERIFIABLE, "note": "the tool has no observer to check its declared frame"}
         with self._mem:
             cached = self._before.get(key)
         before = cached[1] if cached is not None and cached[0] == attempt else None
@@ -857,6 +901,7 @@ class Runtime:
         Runs automatically when a Runtime is constructed (``recover_on_start``). Call it by
         hand only when no worker of this store is running.
         """
+        self._ensure_open()
         moved = []
         for row in self.store.calls(state="executing"):
             target = "effect_unknown" if _effectful(self.registry.get(row.tool)) else "failed"
@@ -868,6 +913,7 @@ class Runtime:
     def receipt(self, key: str, *, signer: Any = None, signing_key: bytes | None = None,
                 key_id: str = "default") -> dict[str, Any]:
         """A machine-verifiable Agent Receipt for one action (see ``receipts``)."""
+        self._ensure_open()
         from .receipts import build_receipt
 
         with self.telemetry.span("sar.receipt", **{"sar.action_id": action_id_for(key)}) as sp:

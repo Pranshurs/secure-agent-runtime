@@ -24,8 +24,10 @@ The schema is ``sar.receipt/v1``; its JSON Schema ships as
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
+import re
 from importlib import resources
 from typing import Any
 
@@ -42,6 +44,11 @@ _NOT_EXECUTED = {"invalid", "denied", "rejected", "expired", "cancelled"}
 def receipt_json_schema() -> dict[str, Any]:
     text = resources.files("secure_agent_runtime").joinpath("schemas/agent-receipt-v1.schema.json").read_text()
     return json.loads(text)
+
+
+@functools.lru_cache(maxsize=1)
+def _required_fields() -> frozenset[str]:
+    return frozenset(receipt_json_schema()["required"])
 
 
 def _outcome(state: str, frame: dict[str, Any] | None, dispatches: int) -> str:
@@ -149,6 +156,10 @@ def _verify(receipt: Any, signing_key: bytes | None, public_keys: dict[str, byte
         return ["receipt is not plain JSON"]
     if receipt.get("digest") != digest:
         problems.append("digest does not match the receipt's content")
+    missing = sorted(_required_fields() - set(receipt))
+    if missing:  # a self-consistent stub is not a receipt
+        problems.append(f"receipt lacks required fields: {missing}")
+        return problems
     if signing_key is not None or public_keys is not None:
         problems += _signature_problems(receipt, signing_key, public_keys)
     action = receipt.get("action") or {}
@@ -231,7 +242,12 @@ def _signature_problems(receipt: dict[str, Any], signing_key: bytes | None,
     sig = receipt.get("signature")
     if not isinstance(sig, dict) or not all(isinstance(sig.get(k), str) for k in ("alg", "key_id", "value")):
         return ["receipt is not signed"]
+    if set(sig) != {"alg", "key_id", "value"}:  # nothing outside the signed message may ride along
+        return ["signature has unexpected fields"]
     alg, kid, value, digest = sig["alg"], sig["key_id"], sig["value"], str(receipt.get("digest"))
+    hex_len = {"Ed25519": 128, "HMAC-SHA256": 64}.get(alg)
+    if hex_len is not None and not re.fullmatch(f"[0-9a-f]{{{hex_len}}}", value):
+        return ["signature value is not in canonical form (lowercase hex)"]  # one encoding per signature
     if alg == "Ed25519":
         if public_keys is None:
             return ["receipt is signed with Ed25519 but no public keys were given"]

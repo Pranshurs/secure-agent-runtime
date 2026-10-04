@@ -3,6 +3,7 @@ end in a recorded, safe state, never in an exception or a call stuck in ``execut
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
@@ -15,7 +16,7 @@ from secure_agent_runtime.auth import TokenAuthenticator
 from secure_agent_runtime.contracts import MAX_JSON_BYTES, Effect, ToolRegistry
 from secure_agent_runtime.examples.notes import AGENT, APPROVER, ScriptedModel, build_runtime
 from secure_agent_runtime.policy import Policy, Principal
-from secure_agent_runtime.runtime import MalformedProposal, Runtime
+from secure_agent_runtime.runtime import ApprovalRefused, MalformedProposal, Runtime
 
 from .conftest import cred, execution_events
 
@@ -324,3 +325,55 @@ def test_finished_run_cannot_be_resumed(store):
     with pytest.raises(ValueError, match="already finished"):
         agent.resume("r")
     assert len(model.seen) == 1
+
+
+@pytest.mark.parametrize("digest", [object(), float("nan"), "\ud800", "x" * 5_000_000, None, 7],
+                         ids=["object", "nan", "surrogate", "5MB", "none", "int"])
+def test_a_hostile_action_digest_is_refused_cleanly_and_not_logged(store, digest):
+    rt, app = build_runtime(store)
+    o = rt.propose(run_id="r", principal_id=AGENT, call_id="w", tool="write_note",
+                   arguments={"title": "t", "body": "b"})
+    with pytest.raises(ApprovalRefused, match="action_digest must be"):
+        rt.approve(o.key, credential=cred(rt, APPROVER), action_digest=digest)
+    assert max(len(json.dumps(e.data)) for e in store.events()) < 1_000
+    assert rt.store.get_call(o.key).state == "awaiting_approval" and store.verify_audit()[0]
+
+
+def test_caller_supplied_reasons_are_bounded_text(store):
+    rt, app = build_runtime(store)
+    o = rt.propose(run_id="r", principal_id=AGENT, call_id="w", tool="write_note",
+                   arguments={"title": "t", "body": "b"})
+    out = rt.cancel(o.key, reason="\ud800" + "y" * 5_000_000)
+    assert out.state == "cancelled" and len(out.reason) <= 500 and store.verify_audit()[0]
+
+
+def test_a_closed_runtime_refuses_every_operation(store):
+    from secure_agent_runtime.errors import SARError
+
+    rt, app = build_runtime(store)
+    o = rt.propose(run_id="r", principal_id=AGENT, call_id="w", tool="write_note",
+                   arguments={"title": "t", "body": "b"})
+    rt.close()
+    for op in (lambda: rt.propose(run_id="r", principal_id=AGENT, call_id="x", tool="read_note",
+                                  arguments={"title": "t"}),
+               lambda: rt.approve(o.key, credential="c", action_digest=o.action_digest),
+               lambda: rt.reject(o.key, credential="c"), lambda: rt.cancel(o.key), lambda: rt.execute(o.key),
+               lambda: rt.reconcile(o.key), lambda: rt.resolve(o.key, credential="c", applied=False),
+               rt.recover, lambda: rt.receipt(o.key), rt.expire_pending):
+        with pytest.raises(SARError, match="closed"):
+            op()
+    assert len(store.calls()) == 1  # nothing was written after close
+    build_runtime(store)  # the store is free for a successor
+
+
+@pytest.mark.parametrize("ttl", [float("nan"), float("inf"), 0, -1, "60", True])
+def test_approval_ttl_must_be_a_positive_finite_number(store, ttl):
+    with pytest.raises(ValueError, match="approval_ttl_s"):
+        build_runtime(store, approval_ttl_s=ttl)
+
+
+def test_a_deadline_too_large_for_a_float_is_a_value_error(store):
+    rt, app = build_runtime(store)
+    with pytest.raises(ValueError, match="deadline must be a finite number"):
+        rt.propose(run_id="r", principal_id=AGENT, call_id="d", tool="read_note", arguments={"title": "t"},
+                   deadline=10**400)
