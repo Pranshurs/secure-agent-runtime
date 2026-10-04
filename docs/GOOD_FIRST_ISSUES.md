@@ -22,5 +22,5 @@ and has an obvious test.
 7. **`Policy` constraint helpers.** Add small reusable constraints such as
    `max_value("amount_inr", 10_000)` or `one_of("currency", {...})`, each with a mutant.
 
-Larger, discuss first: an Ed25519 receipt signer, an MCP client adapter, a
-subprocess-isolated tool runner.
+Larger, discuss first: an MCP client adapter, several processes sharing one store,
+external anchoring of the audit chain head, receipt key rotation and revocation.

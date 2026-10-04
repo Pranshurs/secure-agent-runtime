@@ -23,23 +23,31 @@ pytest && ruff check .
 2. **Test through the public API** (`Runtime`, `Agent`, `verify_receipt`,
    `check_frame`), not private helpers. Never write a test that only greps the source.
 3. **Concurrency and crashes are part of the API.** Use barriers for races and the
-   `faults=` hook for crash points.
-4. **No claims without a command.** Any number in the README must come from a script
+   `faults=` hook for crash points. Real process deaths go through
+   `tests/crash_harness.py` (a child process killed at a named boundary).
+4. **Whoever creates a `Store` closes it.** Use the `store` fixture or `with Store(...)`.
+   An automatic fixture fails any test that leaves a store open.
+5. **No claims without a command.** Any number in the README must come from a script
    anyone can rerun.
-5. Supported Python versions are 3.10 and 3.12 in CI. Run `ruff check .` before pushing.
+6. CI runs Python 3.10–3.13 on Linux and 3.12 on macOS, plus ruff, mypy, bandit,
+   pip-audit, a secret scan, packaging checks, a deep property/fuzz/crash/stress job and
+   the mutation run. Run `ruff check . && mypy src && pytest` before pushing.
 
 ## Layout
 
 ```
 src/secure_agent_runtime/
-  action.py      canonical action envelope        effects.py   observers + frame checks
-  contracts.py   tool contracts, validation        receipts.py  Agent Receipts
-  policy.py      authority                         runtime.py   the governor
-  store.py       SQLite state machine + audit      agent.py     minimal agent loop
-  examples/      notes, refund, version_bump       schemas/     receipt JSON Schema
+  action.py      canonical action envelope        effects.py    observers + frame checks
+  contracts.py   tool contracts, validation        receipts.py   Agent Receipts
+  policy.py      authority                         runtime.py    the governor
+  store.py       SQLite state machine + audit      isolation.py  killable worker processes
+  auth.py        Authenticator, AuthContext        signing.py    Ed25519 / HMAC signers
+  telemetry.py   optional OpenTelemetry            errors.py     exception types
+  agent.py       minimal agent loop                __main__.py   CLI
+  examples/      notes, refund, version_bump       schemas/      receipt JSON Schema
 tests/           one file per concern
-scripts/         mutation_test.py, bench.py
-docs/            architecture and semantics
+scripts/         mutation_test.py, stress.py, bench.py
+docs/            architecture, semantics, threat model, operations
 ```
 
 ## Not in scope

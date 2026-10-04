@@ -2,7 +2,11 @@
 
 Originally written 2026-10-04 while the project was paused; work resumed the same day with
 the first vertical slice. The sections below record the design and the dependency research
-behind it. For how the code works today, see the README.
+behind it. For how the code works today, see the README and
+[TRANSACTION_SEMANTICS.md](TRANSACTION_SEMANTICS.md). Some early names and plans below were
+later changed: `outcome_unknown` and `timed_out` became `effect_unknown`; approvals are bound
+to the full action digest, not just an arguments hash; and tools can now run in a killable
+worker process (`isolation="process"`), not only in a thread.
 
 ## State of the code
 **Direction change (2026-10-04).** SAR is now positioned as a framework-neutral
