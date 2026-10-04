@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS events (
     prev_hash  TEXT NOT NULL,
     hash       TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS events_call ON events(call_key);
 """
 
 
@@ -176,8 +177,11 @@ class Store:
         with self.tx() as db:
             self._append(db, run_id, call_key, kind, data)
 
-    def events(self, run_id: str | None = None, kind: str | None = None) -> list[Event]:
+    def events(self, run_id: str | None = None, kind: str | None = None,
+               call_key: str | None = None) -> list[Event]:
         q, p = "SELECT * FROM events WHERE 1=1", []
+        if call_key is not None:
+            q, p = q + " AND call_key=?", p + [call_key]
         if run_id is not None:
             q, p = q + " AND run_id=?", p + [run_id]
         if kind is not None:

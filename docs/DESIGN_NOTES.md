@@ -1,24 +1,24 @@
-# Secure Agent Runtime: design notes
+# Secure Agent Runtime: design notes (history and research)
 
 Originally written 2026-10-04 while the project was paused; work resumed the same day with
 the first vertical slice. The sections below record the design and the dependency research
 behind it. For how the code works today, see the README.
 
 ## State of the code
-The first slice (the notes agent) is built and tested:
-- `contracts.py`: `ToolSpec` with pydantic input and output models (both must forbid extra
-  fields), strict JSON-mode validation, a declared `Effect`, a timeout, and the canonical
-  args hash. Retries were dropped from this slice: nothing retries, so a retry rule would be
-  untested.
-- `policy.py`: a deterministic, default-deny policy over (principal grants, argument
-  constraints, effect-based approval). It never reads model text.
-- `store.py`: SQLite with compare-and-set call transitions, a closed transition table, and
-  a hash-chained audit log appended in the same transaction as each transition. The draft's
-  run-state table was dropped; transcripts are in memory for now.
-- `runtime.py`: the governor (`propose`, `approve`, `reject`, `cancel`, `execute`,
-  `expire_pending`, `recover`).
-- `agent.py`: a minimal provider-neutral agent loop.
-- `examples/notes.py`: the slice itself.
+**Direction change (2026-10-04).** SAR is now positioned as a framework-neutral
+*transactional execution layer*: canonical actions, authority, argument-bound approval,
+durable execution state with explicit `effect_unknown` and reconciliation, frame
+conditions, and Agent Receipts. It is deliberately not a sandbox, MCP firewall or policy
+proxy. The README and `docs/ARCHITECTURE.md` describe the current code. What changed
+from the first drafts:
+
+- `contracts.py`: kept strict pydantic validation. Added a tool version, schema digest,
+  reconciler, observer and frame builder, and dropped the retry rule.
+- `policy.py`: kept almost unchanged (default deny, constraints fail closed).
+- `store.py`: kept CAS plus the hash chain. Added a closed transition table with
+  `effect_unknown`, attempt fencing and per-action event lookup, and dropped the run
+  table.
+- New modules: `action.py`, `effects.py`, `receipts.py`, `runtime.py`, `agent.py`.
 
 ## Thesis
 The model proposes; the runtime disposes. Policy decisions use only structured facts:

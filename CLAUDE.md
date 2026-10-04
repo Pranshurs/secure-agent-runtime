@@ -1,8 +1,14 @@
 # CLAUDE.md: standing rules for this repository
 
-Read `docs/DESIGN_NOTES.md` before changing code. Thesis: the model proposes, the runtime
-disposes. Policy uses only the principal, the operator-registered tool spec and validated
-arguments, never model text.
+Read `docs/ARCHITECTURE.md` and `docs/TRANSACTION_SEMANTICS.md` before changing code.
+Thesis: the model proposes, the runtime disposes. Policy uses only the principal, the
+operator-registered tool spec and validated arguments, never model text.
+
+Identity: a framework-neutral **transactional execution layer** for AI agents (authority,
+transaction semantics, uncertain-effect reconciliation, frame conditions, Agent
+Receipts). Not a generic sandbox, MCP firewall, policy proxy or framework wrapper. Out of
+scope for now: RAG, memory/vector DBs, multi-agent, chat UI, marketplace, policy DSL,
+Kubernetes, hosted control plane, billing, observability platform, model routing.
 
 ## Why this project exists
 - A public portfolio piece for Applied AI / Agentic AI / AI infrastructure roles (India, EU,
@@ -52,5 +58,6 @@ arguments, never model text.
 - Install: `pip install -e '.[dev]'`
 - Tests: `pytest`
 - Lint: `ruff check .`
-- Demo: `python -m secure_agent_runtime.examples.notes`
+- Demos: `secure-agent-runtime demo` (refund, frame, notes)
 - Safety-rule mutation run: `python scripts/mutation_test.py`
+- Overhead benchmark: `python scripts/bench.py`

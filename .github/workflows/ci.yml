@@ -23,8 +23,27 @@ jobs:
       - run: python -m pip install -e '.[dev]'
       - run: ruff check .
       - run: pytest
-      - name: Demo runs
-        run: python -m secure_agent_runtime.examples.notes
+      - name: Demos run
+        run: python -m secure_agent_runtime demo
+
+  clean-install:
+    # Build the wheel and use it from a fresh venv outside the checkout, like a user would.
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip wheel --no-deps . -w dist
+      - name: Install into a fresh venv and run from elsewhere
+        run: |
+          python -m venv /tmp/venv
+          /tmp/venv/bin/pip install dist/*.whl
+          cd /tmp
+          /tmp/venv/bin/secure-agent-runtime demo
+          /tmp/venv/bin/secure-agent-runtime schema > /dev/null
+          /tmp/venv/bin/python -c "import secure_agent_runtime as s; print(s.__version__)"
 
   mutation:
     # Breaks each safety rule on purpose; fails if any non-equivalent mutant survives.

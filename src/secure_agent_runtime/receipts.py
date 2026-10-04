@@ -60,7 +60,7 @@ def build_receipt(store: Store, key: str, *, signing_key: bytes | None = None,
     row = store.get_call(key)
     if row is None:
         raise KeyError(f"no action {key!r}")
-    events = [e for e in store.events(run_id=row.run_id) if e.call_key == key]
+    events = store.events(call_key=key)
     seq, head = store.head()
     initial = next((e for e in events if e.kind != "call.requested"), None)
     reconciliation = [{"kind": e.kind, "data": e.data, "at": e.ts} for e in events
@@ -161,7 +161,7 @@ def _verify(receipt: Any, signing_key: bytes | None, store: Store | None) -> lis
     action = receipt.get("action") or {}
     if action and row.action_digest != action.get("digest"):
         problems.append("stored action digest differs from the receipt")
-    stored = [e for e in store.events(run_id=row.run_id) if e.call_key == key]
+    stored = store.events(call_key=key)
     listed = audit["events"]
     upto = [e for e in stored if e.seq <= head["seq"]]
     if not listed or [(e.seq, e.kind, e.hash) for e in upto] != [(e["seq"], e["kind"], e["hash"]) for e in listed]:
