@@ -18,7 +18,14 @@ Then it checks, against the ledger (ground truth):
 * every action is settled: succeeded with exactly one effect, or ended with none;
 * no worker thread is deadlocked (all joins finish);
 * the audit chain verifies and every row's state is its last state event;
-* claimed dispatches >= provider calls (a claim may precede a cooperative cancel).
+* claimed dispatches >= provider calls (a claim may precede a cooperative cancel);
+* approval attacks racing the real approver (a wrong digest, a credential scoped to another
+  action, a replayed credential) are all refused, and every approved row's approval binds
+  that row's own action digest;
+* every action's receipt verifies against the store; a tampered receipt and a tampered
+  copy of the database are both detected;
+* frame checks never report "verified" unless the only observed change is this action's
+  own refund (concurrent refunds make most frames "violated", which is correct).
 
 Prints one JSON line per round and exits 1 if any invariant failed.
 """
@@ -30,6 +37,8 @@ import functools
 import json
 import os
 import random
+import shutil
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -42,9 +51,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from secure_agent_runtime.auth import TokenAuthenticator
 from secure_agent_runtime.contracts import Applied, Effect, EffectNotApplied, NotApplied, ToolContext, ToolRegistry
-from secure_agent_runtime.errors import SARError, StoreError
+from secure_agent_runtime.effects import FrameSpec, MappingObserver, Required
+from secure_agent_runtime.errors import CredentialReused, SARError, StoreError
 from secure_agent_runtime.examples.refund import ConnectionLost, PaymentService
 from secure_agent_runtime.policy import Policy, Principal
+from secure_agent_runtime.receipts import verify_receipt
 from secure_agent_runtime.runtime import ApprovalRefused, ReplayDivergence, Runtime
 from secure_agent_runtime.store import Store
 
@@ -85,7 +96,13 @@ def stress_tool(ledger_path: str, args: StressIn, ctx: ToolContext) -> StressOut
 def build(store: Store, ledger: PaymentService) -> Runtime:
     reg = ToolRegistry()
     fn = functools.partial(stress_tool, ledger.path)
-    reg.tool(name="pay", input=StressIn, output=StressOut, effect=Effect.EXTERNAL, timeout_s=0.5)(fn)
+    observer = MappingObserver(lambda: {f"refunds/{rid}": r for rid, r in ledger.refunds.items()})
+
+    def frame(args: StressIn) -> FrameSpec:  # exactly one new refund, for this order
+        return FrameSpec(required=(Required("refunds/*", "added", count=1, after_contains=f'"order":{args.order}}}'),))
+
+    reg.tool(name="pay", input=StressIn, output=StressOut, effect=Effect.EXTERNAL, timeout_s=0.5,
+             observer=observer, frame=frame)(fn)
     reg.tool(name="pay_p", input=StressIn, output=StressOut, effect=Effect.EXTERNAL, timeout_s=10,
              isolation="process")(fn)
 
@@ -120,6 +137,7 @@ def run_round(seed: int, n_actions: int, n_threads: int, round_no: int) -> dict[
                       "dupes": rng.randint(1, 3), "cancel": rng.random() < 0.05})
     keys: dict[str, str] = {}
     unexpected: list[str] = []
+    attack_successes: list[str] = []
 
     def count(name: str) -> None:
         with lock:
@@ -140,6 +158,30 @@ def run_round(seed: int, n_actions: int, n_threads: int, round_no: int) -> dict[
             with lock:
                 unexpected.append(f"{type(exc).__name__}: {exc}")
 
+    used_credentials: list[str] = []
+
+    def attack(key: str, row: Any) -> None:
+        """Approvals that must never succeed, racing the real approver."""
+        other = next((store.get_call(k) for k in rng.sample(sorted(keys.values()), 2) if k != key), None)
+        bogus = [("wrong_digest", rt.authenticator.issue(APPROVER), "sha256:" + "0" * 64)]
+        if other is not None and other.action_digest:
+            bogus.append(("other_scope", rt.authenticator.issue(APPROVER, scope=other.action_digest),
+                          row.action_digest))
+        with lock:
+            replay = rng.choice(used_credentials) if used_credentials else None
+        if replay is not None:
+            bogus.append(("replayed", replay, row.action_digest))
+        for kind, credential, digest in bogus:
+            try:
+                rt.approve(key, credential=credential, action_digest=digest)
+            except (ApprovalRefused, CredentialReused):
+                count("attack_refused:" + kind)
+            except SARError:
+                count("attack_refused:" + kind)
+            else:
+                with lock:
+                    attack_successes.append(f"{key}: {kind} approval accepted")
+
     def worker(p: dict[str, Any]) -> None:
         key = keys.get(p["call"])
         if key is None:
@@ -149,8 +191,13 @@ def run_round(seed: int, n_actions: int, n_threads: int, round_no: int) -> dict[
             if p["cancel"] and rng.random() < 0.5:
                 rt.cancel(key)
             if row is not None and row.state == "awaiting_approval":
+                if rng.random() < 0.3:
+                    attack(key, row)
+                credential = rt.authenticator.issue(APPROVER)
                 try:
-                    rt.approve(key, credential=rt.authenticator.issue(APPROVER), action_digest=row.action_digest)
+                    rt.approve(key, credential=credential, action_digest=row.action_digest)
+                    with lock:
+                        used_credentials.append(credential)
                 except ApprovalRefused:
                     count("approve_raced")
             rt.execute(key)
@@ -218,6 +265,28 @@ def run_round(seed: int, n_actions: int, n_threads: int, round_no: int) -> dict[
         if events[-1] != f"call.{row.state}":
             failures.append(f"{key}: row state {row.state} not backed by last event {events[-1]}")
         stats["state:" + row.state] += 1
+        if row.approval is not None and row.approval.get("action_digest") != row.action_digest:
+            failures.append(f"{key}: approval binds {row.approval.get('action_digest')}, not {row.action_digest}")
+        receipt = rt.receipt(key)
+        problems = verify_receipt(receipt, expect_key=key, store=store)
+        if problems:
+            failures.append(f"{key}: receipt does not verify against the store: {problems}")
+        check = (receipt.get("effects") or {}).get("check")
+        if check is not None:
+            stats["frame:" + check["verdict"]] += 1
+            if check["verdict"] == "verified":
+                obs = check["observed"]
+                mine = [f"refunds/{rid}" for rid, r in ledger.refunds.items() if r["idempotency_key"] == key]
+                if [(c["path"], c["change"]) for c in obs] != [(m, "added") for m in mine] or len(mine) != 1:
+                    failures.append(f"{key}: frame verified but observed {obs}")
+    if attack_successes:
+        failures.append(f"{len(attack_successes)} forged approvals accepted, e.g. {attack_successes[0]}")
+    succeeded = [k for k in keys.values() if store.get_call(k).state == "succeeded"]  # type: ignore[union-attr]
+    if succeeded:  # a receipt edited after issue must not verify
+        forged = rt.receipt(rng.choice(succeeded))
+        forged["execution"]["dispatches"] += 1
+        if not verify_receipt(forged, store=store):
+            failures.append("a tampered receipt verified")
     ok, msg = store.verify_audit()
     if not ok:
         failures.append(f"audit: {msg}")
@@ -229,14 +298,39 @@ def run_round(seed: int, n_actions: int, n_threads: int, round_no: int) -> dict[
     if unexpected:
         failures.append(f"{len(unexpected)} unexpected exceptions from the public API, e.g. {unexpected[0]}")
     late = len(store.events(kind="call.late_result_discarded"))
+    rt.close()
     store.close()
+    tamper_detected = _tampered_copy_is_detected(os.path.join(tmp, "sar.db"), rng)
+    if not tamper_detected:
+        failures.append("an edited event in a copy of the database was not detected by verify_audit")
     return {"seed": seed, "round": round_no, "actions": n_actions, "threads": n_threads,
             "proposals": stats["proposals"], "duplicates_absorbed": stats["proposals"] - n_actions,
             "claims": claims, "provider_calls": ledger.calls, "effects": sum(refunds.values()),
             "late_results_discarded": late,
             "store_errors": stats["store_errors"], "unexpected_exceptions": len(unexpected),
+            "approval_attacks_refused": {k[15:]: v for k, v in stats.items() if k.startswith("attack_refused:")},
+            "forged_approvals_accepted": len(attack_successes), "receipts_verified": len(plans),
+            "frames": {k[6:]: v for k, v in stats.items() if k.startswith("frame:")},
+            "tampered_db_detected": tamper_detected,
             "states": {k[6:]: v for k, v in stats.items() if k.startswith("state:")},
             "seconds": round(elapsed, 2), "failures": failures}
+
+
+def _tampered_copy_is_detected(path: str, rng: random.Random) -> bool:
+    """Edit one random event's data in a copy of the closed database; verify_audit must fail."""
+    copy = path + ".tampered"
+    shutil.copy(path, copy)
+    db = sqlite3.connect(copy)
+    try:
+        (n,) = db.execute("SELECT COUNT(*) FROM events").fetchone()
+        seq = rng.randint(1, n)
+        db.execute("UPDATE events SET data_json = json_set(data_json, '$.tampered', 1) WHERE seq=?", (seq,))
+        db.commit()
+    finally:
+        db.close()
+    with Store(copy) as s:
+        ok, _ = s.verify_audit()
+    return not ok
 
 
 def _run_pool(threads: list[threading.Thread], width: int) -> int:

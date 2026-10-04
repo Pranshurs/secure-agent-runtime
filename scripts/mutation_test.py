@@ -574,7 +574,8 @@ def run_suite(root: Path, timeout: float) -> tuple[bool, str]:
     except subprocess.TimeoutExpired:
         return False, "timeout"
     lines = (p.stdout + p.stderr).strip().splitlines()
-    failed = next((ln.split("::", 1)[-1] for ln in lines if ln.startswith(("FAILED ", "ERROR "))), "")
+    # pytest's summary lines only ("FAILED tests/..." / "ERROR tests/..."), not captured log lines
+    failed = next((ln.split("::", 1)[-1] for ln in lines if ln.startswith(("FAILED tests/", "ERROR tests/"))), "")
     return p.returncode == 0, failed or (lines[-1] if lines else "")
 
 
