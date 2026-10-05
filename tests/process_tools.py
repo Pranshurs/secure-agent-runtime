@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 
 from pydantic import BaseModel, ConfigDict
 
@@ -39,11 +40,14 @@ class LateIn(BaseModel):
     dir: str
 
 
-def act_later(d: str) -> None:
-    """Say it is running, then act only once the test creates <d>/release."""
+def act_later(d: str, ready: threading.Event | None = None) -> None:
+    """Say it is running, then act only once the test creates <d>/release. A thread caller
+    passes a threading.Event as `ready`; it is set once <d>/started exists."""
     import time
 
     open(os.path.join(d, "started"), "w").close()
+    if ready is not None:
+        ready.set()
     for _ in range(600):
         if os.path.exists(os.path.join(d, "release")):
             open(os.path.join(d, "late_effect"), "w").close()
@@ -54,7 +58,6 @@ def act_later(d: str) -> None:
 def late_tool(args: LateIn) -> object:
     import subprocess  # nosec B404 - test helper
     import sys
-    import threading
     import time
 
     if args.mode == "child":  # a child in the worker's process group, then the tool hangs
@@ -62,5 +65,10 @@ def late_tool(args: LateIn) -> object:
                 "from tests.process_tools import act_later; act_later(sys.argv[1])")
         subprocess.Popen([sys.executable, "-c", code, args.dir, *sys.path])  # nosec B603
         time.sleep(60)
-    threading.Thread(target=act_later, args=(args.dir,)).start()  # non-daemon: outlives the reply
+    ready = threading.Event()
+    threading.Thread(target=act_later, args=(args.dir, ready)).start()  # non-daemon: outlives the reply
+    # Return only once the leftover has really started, or SAR may kill the worker before the
+    # thread writes 'started' and the test would see nothing to fence. Bounded, and loud on timeout.
+    if not ready.wait(10):
+        raise RuntimeError("the leftover thread did not start within 10 s")
     return Out(ok=True)
